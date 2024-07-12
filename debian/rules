@@ -223,6 +223,9 @@ endif
 endif
 endif
 
+# Droidian extensions
+CONFFLAGS_DISTRO += -Dc_args='-DWITH_DROIDIAN_EXTENSIONS'
+
 override_dh_auto_configure:
 	dh_auto_configure \
 		-- $(CONFFLAGS) $(CONFFLAGS_DISTRO) $(CONFFLAGS_UPSTREAM)

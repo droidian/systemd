@@ -161,10 +161,20 @@ bool cg_is_legacy_force_enabled(void) {
         if (detect_container() > 0)
                 return true;
 
+        /* Droidian: do not require a special cmdline for cgroup v1 */
+#ifndef WITH_DROIDIAN_EXTENSIONS
         if (proc_cmdline_get_bool("SYSTEMD_CGROUP_ENABLE_LEGACY_FORCE", /* flags = */ 0, &force) < 0)
                 return false;
+#else
+        int r;
+        bool b;
+        r = proc_cmdline_get_bool("systemd.unified_cgroup_hierarchy", /* flags = */ 0, &b);
+        if (r > 0)
+                force = !b;
+#endif /* WITH_DROIDIAN_EXTENSIONS */
 
         return force;
+
 }
 
 int cg_weight_parse(const char *s, uint64_t *ret) {

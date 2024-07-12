@@ -1764,6 +1764,7 @@ static void cmdline_take_random_seed(void) {
                    "This functionality should not be used outside of testing environments.");
 }
 
+
 static void initialize_core_pattern(bool skip_setup) {
         int r;
 
@@ -3091,10 +3092,12 @@ int main(int argc, char *argv[]) {
                                         error_message = "Failed to mount cgroup v1 hierarchy";
                                 goto finish;
                         }
+#ifndef WITH_DROIDIAN_EXTENSIONS
                         if (r > 0) {
                                 log_full(LOG_CRIT, "Legacy cgroup v1 support selected. This is no longer supported. Will proceed anyway after 30s.");
                                 (void) usleep_safe(30 * USEC_PER_SEC);
                         }
+#endif /* WITH_DROIDIAN_EXTENSIONS */
                 }
 
                 /* The efivarfs is now mounted, let's lock down the system token. */
