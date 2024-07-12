@@ -22,6 +22,7 @@
 #include "log.h"
 #include "login-util.h"
 #include "macro.h"
+#include "missing_fs.h"
 #include "missing_magic.h"
 #include "missing_threads.h"
 #include "mkdir.h"
@@ -38,6 +39,38 @@
 #include "unit-name.h"
 #include "user-util.h"
 #include "xattr-util.h"
+
+int cg_path_open(const char *controller, const char *path) {
+        _cleanup_free_ char *fs = NULL;
+        int r;
+
+        r = cg_get_path(controller, path, /* item=*/ NULL, &fs);
+        if (r < 0)
+                return r;
+
+        return RET_NERRNO(open(fs, O_DIRECTORY|O_CLOEXEC));
+}
+
+int cg_cgroupid_open(int cgroupfs_fd, uint64_t id) {
+        _cleanup_close_ int fsfd = -EBADF;
+
+        if (cgroupfs_fd < 0) {
+                fsfd = open("/sys/fs/cgroup", O_CLOEXEC|O_DIRECTORY);
+                if (fsfd < 0)
+                        return -errno;
+
+                cgroupfs_fd = fsfd;
+        }
+
+        cg_file_handle fh = CG_FILE_HANDLE_INIT;
+        CG_FILE_HANDLE_CGROUPID(fh) = id;
+
+        int fd = open_by_handle_at(cgroupfs_fd, &fh.file_handle, O_DIRECTORY|O_CLOEXEC);
+        if (fd < 0)
+                return -errno;
+
+        return fd;
+}
 
 static int cg_enumerate_items(const char *controller, const char *path, FILE **ret, const char *item) {
         _cleanup_free_ char *fs = NULL;
@@ -62,7 +95,7 @@ int cg_enumerate_processes(const char *controller, const char *path, FILE **ret)
         return cg_enumerate_items(controller, path, ret, "cgroup.procs");
 }
 
-int cg_read_pid(FILE *f, pid_t *ret) {
+int cg_read_pid(FILE *f, pid_t *ret, CGroupFlags flags) {
         unsigned long ul;
 
         /* Note that the cgroup.procs might contain duplicates! See cgroups.txt for details. */
@@ -70,27 +103,33 @@ int cg_read_pid(FILE *f, pid_t *ret) {
         assert(f);
         assert(ret);
 
-        errno = 0;
-        if (fscanf(f, "%lu", &ul) != 1) {
+        for (;;) {
+                errno = 0;
+                if (fscanf(f, "%lu", &ul) != 1) {
 
-                if (feof(f)) {
-                        *ret = 0;
-                        return 0;
+                        if (feof(f)) {
+                                *ret = 0;
+                                return 0;
+                        }
+
+                        return errno_or_else(EIO);
                 }
 
-                return errno_or_else(EIO);
+                if (ul > PID_T_MAX)
+                        return -EIO;
+
+                /* In some circumstances (e.g. WSL), cgroups might contain unmappable PIDs from other
+                 * contexts. These show up as zeros, and depending on the caller, can either be plain
+                 * skipped over, or returned as-is. */
+                if (ul == 0 && !FLAGS_SET(flags, CGROUP_DONT_SKIP_UNMAPPED))
+                        continue;
+
+                *ret = (pid_t) ul;
+                return 1;
         }
-
-        if (ul <= 0)
-                return -EIO;
-        if (ul > PID_T_MAX)
-                return -EIO;
-
-        *ret = (pid_t) ul;
-        return 1;
 }
 
-int cg_read_pidref(FILE *f, PidRef *ret) {
+int cg_read_pidref(FILE *f, PidRef *ret, CGroupFlags flags) {
         int r;
 
         assert(f);
@@ -99,12 +138,20 @@ int cg_read_pidref(FILE *f, PidRef *ret) {
         for (;;) {
                 pid_t pid;
 
-                r = cg_read_pid(f, &pid);
+                r = cg_read_pid(f, &pid, flags);
                 if (r < 0)
-                        return r;
+                        return log_debug_errno(r, "Failed to read pid from cgroup item: %m");
                 if (r == 0) {
                         *ret = PIDREF_NULL;
                         return 0;
+                }
+
+                if (pid == 0)
+                        return -EREMOTE;
+
+                if (FLAGS_SET(flags, CGROUP_NO_PIDFD)) {
+                        *ret = PIDREF_MAKE_FROM_PID(pid);
+                        return 1;
                 }
 
                 r = pidref_set_pid(ret, pid);
@@ -135,7 +182,7 @@ int cg_read_event(
                 return r;
 
         for (const char *p = content;;) {
-                _cleanup_free_ char *line = NULL, *key = NULL, *val = NULL;
+                _cleanup_free_ char *line = NULL, *key = NULL;
                 const char *q;
 
                 r = extract_first_word(&p, &line, "\n", 0);
@@ -154,12 +201,7 @@ int cg_read_event(
                 if (!streq(key, event))
                         continue;
 
-                val = strdup(q);
-                if (!val)
-                        return -ENOMEM;
-
-                *ret = TAKE_PTR(val);
-                return 0;
+                return strdup_to(ret, q);
         }
 }
 
@@ -234,20 +276,13 @@ int cg_read_subgroup(DIR *d, char **ret) {
         assert(ret);
 
         FOREACH_DIRENT_ALL(de, d, return -errno) {
-                char *b;
-
                 if (de->d_type != DT_DIR)
                         continue;
 
                 if (dot_or_dot_dot(de->d_name))
                         continue;
 
-                b = strdup(de->d_name);
-                if (!b)
-                        return -ENOMEM;
-
-                *ret = b;
-                return 1;
+                return strdup_to_full(ret, de->d_name);
         }
 
         *ret = NULL;
@@ -317,14 +352,14 @@ static int cg_kill_items(
                 if (r == -ENOENT)
                         break;
                 if (r < 0)
-                        return RET_GATHER(ret, r);
+                        return RET_GATHER(ret, log_debug_errno(r, "Failed to enumerate cgroup items: %m"));
 
                 for (;;) {
                         _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
 
-                        r = cg_read_pidref(f, &pidref);
+                        r = cg_read_pidref(f, &pidref, flags);
                         if (r < 0)
-                                return RET_GATHER(ret, r);
+                                return RET_GATHER(ret, log_debug_errno(r, "Failed to read pidref from cgroup '%s': %m", path));
                         if (r == 0)
                                 break;
 
@@ -340,7 +375,7 @@ static int cg_kill_items(
                         /* If we haven't killed this process yet, kill it */
                         r = pidref_kill(&pidref, sig);
                         if (r < 0 && r != -ESRCH)
-                                RET_GATHER(ret, r);
+                                RET_GATHER(ret, log_debug_errno(r, "Failed to kill process with pid " PID_FMT " from cgroup '%s': %m", pidref.pid, path));
                         if (r >= 0) {
                                 if (flags & CGROUP_SIGCONT)
                                         (void) pidref_kill(&pidref, SIGCONT);
@@ -379,6 +414,8 @@ int cg_kill(
         int r, ret;
 
         r = cg_kill_items(path, sig, flags, s, log_kill, userdata, "cgroup.procs");
+        if (r < 0)
+                log_debug_errno(r, "Failed to kill processes in cgroup '%s' item cgroup.procs: %m", path);
         if (r < 0 || sig != SIGKILL)
                 return r;
 
@@ -393,9 +430,13 @@ int cg_kill(
         if (r == 0)
                 return ret;
 
-        r = cg_kill_items(path, sig, flags, s, log_kill, userdata, "cgroup.threads");
+        /* Opening pidfds for non thread group leaders only works from 6.9 onwards with PIDFD_THREAD. On
+         * older kernels or without PIDFD_THREAD pidfd_open() fails with EINVAL. Since we might read non
+         * thread group leader IDs from cgroup.threads, we set CGROUP_NO_PIDFD to avoid trying open pidfd's
+         * for them and instead use the regular pid. */
+        r = cg_kill_items(path, sig, flags|CGROUP_NO_PIDFD, s, log_kill, userdata, "cgroup.threads");
         if (r < 0)
-                return r;
+                return log_debug_errno(r, "Failed to kill processes in cgroup '%s' item cgroup.threads: %m", path);
 
         return r > 0 || ret > 0;
 }
@@ -418,7 +459,7 @@ int cg_kill_kernel_sigkill(const char *path) {
 
         r = write_string_file(killfile, "1", WRITE_STRING_FILE_DISABLE_BUFFER);
         if (r < 0)
-                return r;
+                return log_debug_errno(r, "Failed to write to cgroup.kill for cgroup '%s': %m", path);
 
         return 0;
 }
@@ -455,7 +496,7 @@ int cg_kill_recursive(
                 r = cg_enumerate_subgroups(SYSTEMD_CGROUP_CONTROLLER, path, &d);
                 if (r < 0) {
                         if (r != -ENOENT)
-                                RET_GATHER(ret, r);
+                                RET_GATHER(ret, log_debug_errno(r, "Failed to enumerate cgroup '%s' subgroups: %m", path));
 
                         return ret;
                 }
@@ -465,7 +506,7 @@ int cg_kill_recursive(
 
                         r = cg_read_subgroup(d, &fn);
                         if (r < 0) {
-                                RET_GATHER(ret, r);
+                                RET_GATHER(ret, log_debug_errno(r, "Failed to read subgroup from cgroup '%s': %m", path));
                                 break;
                         }
                         if (r == 0)
@@ -476,6 +517,8 @@ int cg_kill_recursive(
                                 return -ENOMEM;
 
                         r = cg_kill_recursive(p, sig, flags, s, log_kill, userdata);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to recursively kill processes in cgroup '%s': %m", p);
                         if (r != 0 && ret >= 0)
                                 ret = r;
                 }
@@ -484,7 +527,7 @@ int cg_kill_recursive(
         if (FLAGS_SET(flags, CGROUP_REMOVE)) {
                 r = cg_rmdir(SYSTEMD_CGROUP_CONTROLLER, path);
                 if (!IN_SET(r, -ENOENT, -EBUSY))
-                        RET_GATHER(ret, r);
+                        RET_GATHER(ret, log_debug_errno(r, "Failed to remove cgroup '%s': %m", path));
         }
 
         return ret;
@@ -917,7 +960,7 @@ int cg_is_empty(const char *controller, const char *path) {
         if (r < 0)
                 return r;
 
-        r = cg_read_pid(f, &pid);
+        r = cg_read_pid(f, &pid, CGROUP_DONT_SKIP_UNMAPPED);
         if (r < 0)
                 return r;
 
@@ -1125,44 +1168,29 @@ int cg_pid_get_path_shifted(pid_t pid, const char *root, char **ret_cgroup) {
         if (r < 0)
                 return r;
 
-        if (c == raw)
+        if (c == raw) {
                 *ret_cgroup = TAKE_PTR(raw);
-        else {
-                char *n;
-
-                n = strdup(c);
-                if (!n)
-                        return -ENOMEM;
-
-                *ret_cgroup = n;
+                return 0;
         }
 
-        return 0;
+        return strdup_to(ret_cgroup, c);
 }
 
 int cg_path_decode_unit(const char *cgroup, char **ret_unit) {
-        char *c, *s;
-        size_t n;
-
         assert(cgroup);
         assert(ret_unit);
 
-        n = strcspn(cgroup, "/");
+        size_t n = strcspn(cgroup, "/");
         if (n < 3)
                 return -ENXIO;
 
-        c = strndupa_safe(cgroup, n);
+        char *c = strndupa_safe(cgroup, n);
         c = cg_unescape(c);
 
         if (!unit_name_is_valid(c, UNIT_NAME_PLAIN|UNIT_NAME_INSTANCE))
                 return -ENXIO;
 
-        s = strdup(c);
-        if (!s)
-                return -ENOMEM;
-
-        *ret_unit = s;
-        return 0;
+        return strdup_to(ret_unit, c);
 }
 
 static bool valid_slice_name(const char *p, size_t n) {
@@ -1431,7 +1459,7 @@ int cg_pid_get_machine_name(pid_t pid, char **ret_machine) {
 
 int cg_path_get_cgroupid(const char *path, uint64_t *ret) {
         cg_file_handle fh = CG_FILE_HANDLE_INIT;
-        int mnt_id = -1;
+        int mnt_id;
 
         assert(path);
         assert(ret);
@@ -1439,6 +1467,20 @@ int cg_path_get_cgroupid(const char *path, uint64_t *ret) {
         /* This is cgroupfs so we know the size of the handle, thus no need to loop around like
          * name_to_handle_at_loop() does in mountpoint-util.c */
         if (name_to_handle_at(AT_FDCWD, path, &fh.file_handle, &mnt_id, 0) < 0)
+                return -errno;
+
+        *ret = CG_FILE_HANDLE_CGROUPID(fh);
+        return 0;
+}
+
+int cg_fd_get_cgroupid(int fd, uint64_t *ret) {
+        cg_file_handle fh = CG_FILE_HANDLE_INIT;
+        int mnt_id = -1;
+
+        assert(fd >= 0);
+        assert(ret);
+
+        if (name_to_handle_at(fd, "", &fh.file_handle, &mnt_id, AT_EMPTY_PATH) < 0)
                 return -errno;
 
         *ret = CG_FILE_HANDLE_CGROUPID(fh);
@@ -1467,17 +1509,10 @@ int cg_path_get_session(const char *path, char **ret_session) {
         if (!session_id_valid(start))
                 return -ENXIO;
 
-        if (ret_session) {
-                char *rr;
+        if (!ret_session)
+                return 0;
 
-                rr = strdup(start);
-                if (!rr)
-                        return -ENOMEM;
-
-                *ret_session = rr;
-        }
-
-        return 0;
+        return strdup_to(ret_session, start);
 }
 
 int cg_pid_get_session(pid_t pid, char **ret_session) {
@@ -1534,34 +1569,26 @@ int cg_path_get_slice(const char *p, char **ret_slice) {
         assert(p);
         assert(ret_slice);
 
-        /* Finds the right-most slice unit from the beginning, but
-         * stops before we come to the first non-slice unit. */
+        /* Finds the right-most slice unit from the beginning, but stops before we come to
+         * the first non-slice unit. */
 
         for (;;) {
-                size_t n;
+                const char *s;
+                int n;
 
-                p += strspn(p, "/");
+                n = path_find_first_component(&p, /* accept_dot_dot = */ false, &s);
+                if (n < 0)
+                        return n;
+                if (!valid_slice_name(s, n))
+                        break;
 
-                n = strcspn(p, "/");
-                if (!valid_slice_name(p, n)) {
-
-                        if (!e) {
-                                char *s;
-
-                                s = strdup(SPECIAL_ROOT_SLICE);
-                                if (!s)
-                                        return -ENOMEM;
-
-                                *ret_slice = s;
-                                return 0;
-                        }
-
-                        return cg_path_decode_unit(e, ret_slice);
-                }
-
-                e = p;
-                p += n;
+                e = s;
         }
+
+        if (e)
+                return cg_path_decode_unit(e, ret_slice);
+
+        return strdup_to(ret_slice, SPECIAL_ROOT_SLICE);
 }
 
 int cg_pid_get_slice(pid_t pid, char **ret_slice) {
@@ -1714,15 +1741,8 @@ int cg_slice_to_path(const char *unit, char **ret) {
         assert(unit);
         assert(ret);
 
-        if (streq(unit, SPECIAL_ROOT_SLICE)) {
-                char *x;
-
-                x = strdup("");
-                if (!x)
-                        return -ENOMEM;
-                *ret = x;
-                return 0;
-        }
+        if (streq(unit, SPECIAL_ROOT_SLICE))
+                return strdup_to(ret, "");
 
         if (!unit_name_is_valid(unit, UNIT_NAME_PLAIN))
                 return -EINVAL;
@@ -2141,14 +2161,13 @@ int cg_kernel_controllers(Set **ret) {
                 _cleanup_free_ char *controller = NULL;
                 int enabled = 0;
 
-                errno = 0;
                 if (fscanf(f, "%ms %*i %*i %i", &controller, &enabled) != 2) {
+
+                        if (ferror(f))
+                                return -errno;
 
                         if (feof(f))
                                 break;
-
-                        if (ferror(f))
-                                return errno_or_else(EIO);
 
                         return -EBADMSG;
                 }

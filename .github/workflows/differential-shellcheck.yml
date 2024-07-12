@@ -16,20 +16,25 @@ permissions:
 jobs:
   lint:
     if: github.event.repository.name != 'systemd-security'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     permissions:
       security-events: write
 
     steps:
       - name: Repository checkout
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29
         with:
           fetch-depth: 0
 
       - name: Differential ShellCheck
-        uses: redhat-plumbers-in-action/differential-shellcheck@91e2582e40236f831458392d905578d680baa138
+        uses: redhat-plumbers-in-action/differential-shellcheck@60c9f2b924a9c5a2ddbb25e7b23e8e11b56faab9
         with:
           # exclude all `.in` files because they may contain unsupported syntax, and they have to be preprocessed first
-          exclude-path: '**/*.in'
+          # TEMPORARY: exclude bash completion files, they would generate too many defects in Code scanning dashboard (600+)
+          # exclude zsh completion files, zsh is not supported by ShellCheck
+          exclude-path: |
+            '**/*.in'
+            'shell-completion/bash/*'
+            'shell-completion/zsh/*'
           token: ${{ secrets.GITHUB_TOKEN }}

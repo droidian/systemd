@@ -325,12 +325,22 @@ int fchmod_opath(int fd, mode_t m) {
 int futimens_opath(int fd, const struct timespec ts[2]) {
         /* Similar to fchmod_opath() but for futimens() */
 
-        if (utimensat(AT_FDCWD, FORMAT_PROC_FD_PATH(fd), ts, 0) < 0) {
+        assert(fd >= 0);
+
+        if (utimensat(fd, "", ts, AT_EMPTY_PATH) >= 0)
+                return 0;
+        if (errno != EINVAL)
+                return -errno;
+
+        /* Support for AT_EMPTY_PATH is added rather late (kernel 5.8), so fall back to going through /proc/
+         * if unavailable. */
+
+        if (utimensat(AT_FDCWD, FORMAT_PROC_FD_PATH(fd), ts, /* flags = */ 0) < 0) {
                 if (errno != ENOENT)
                         return -errno;
 
                 if (proc_mounted() == 0)
-                        return -ENOSYS; /* if we have no /proc/, the concept is not implementable */
+                        return -ENOSYS;
 
                 return -ENOENT;
         }
@@ -405,17 +415,14 @@ int touch_file(const char *path, bool parents, usec_t stamp, uid_t uid, gid_t gi
         ret = fchmod_and_chown(fd, mode, uid, gid);
 
         if (stamp != USEC_INFINITY) {
-                struct timespec ts[2];
+                struct timespec ts;
+                timespec_store(&ts, stamp);
 
-                timespec_store(&ts[0], stamp);
-                ts[1] = ts[0];
-                r = futimens_opath(fd, ts);
+                r = futimens_opath(fd, (const struct timespec[2]) { ts, ts });
         } else
-                r = futimens_opath(fd, NULL);
-        if (r < 0 && ret >= 0)
-                return r;
+                r = futimens_opath(fd, /* ts = */ NULL);
 
-        return ret;
+        return RET_GATHER(ret, r);
 }
 
 int symlink_idempotent(const char *from, const char *to, bool make_relative) {
@@ -1018,7 +1025,7 @@ int parse_cifs_service(
         return 0;
 }
 
-int open_mkdir_at(int dirfd, const char *path, int flags, mode_t mode) {
+int open_mkdir_at_full(int dirfd, const char *path, int flags, XOpenFlags xopen_flags, mode_t mode) {
         _cleanup_close_ int fd = -EBADF, parent_fd = -EBADF;
         _cleanup_free_ char *fname = NULL, *parent = NULL;
         int r;
@@ -1054,7 +1061,7 @@ int open_mkdir_at(int dirfd, const char *path, int flags, mode_t mode) {
                 path = fname;
         }
 
-        fd = xopenat_full(dirfd, path, flags|O_CREAT|O_DIRECTORY|O_NOFOLLOW, /* xopen_flags = */ 0, mode);
+        fd = xopenat_full(dirfd, path, flags|O_CREAT|O_DIRECTORY|O_NOFOLLOW, xopen_flags, mode);
         if (IN_SET(fd, -ELOOP, -ENOTDIR))
                 return -EEXIST;
         if (fd < 0)
@@ -1235,4 +1242,100 @@ int xopenat_lock_full(
         }
 
         return TAKE_FD(fd);
+}
+
+int link_fd(int fd, int newdirfd, const char *newpath) {
+        int r;
+
+        assert(fd >= 0);
+        assert(newdirfd >= 0 || newdirfd == AT_FDCWD);
+        assert(newpath);
+
+        /* Try linking via /proc/self/fd/ first. */
+        r = RET_NERRNO(linkat(AT_FDCWD, FORMAT_PROC_FD_PATH(fd), newdirfd, newpath, AT_SYMLINK_FOLLOW));
+        if (r != -ENOENT)
+                return r;
+
+        /* Fall back to symlinking via AT_EMPTY_PATH as fallback (this requires CAP_DAC_READ_SEARCH and a
+         * more recent kernel, but does not require /proc/ mounted) */
+        if (proc_mounted() != 0)
+                return r;
+
+        return RET_NERRNO(linkat(fd, "", newdirfd, newpath, AT_EMPTY_PATH));
+}
+
+int linkat_replace(int olddirfd, const char *oldpath, int newdirfd, const char *newpath) {
+        _cleanup_close_ int old_fd = -EBADF;
+        int r;
+
+        assert(olddirfd >= 0 || olddirfd == AT_FDCWD);
+        assert(newdirfd >= 0 || newdirfd == AT_FDCWD);
+        assert(!isempty(newpath)); /* source path is optional, but the target path is not */
+
+        /* Like linkat() but replaces the target if needed. Is a NOP if source and target already share the
+         * same inode. */
+
+        if (olddirfd == AT_FDCWD && isempty(oldpath)) /* Refuse operating on the cwd (which is a dir, and dirs can't be hardlinked) */
+                return -EISDIR;
+
+        if (path_implies_directory(oldpath)) /* Refuse these definite directories early */
+                return -EISDIR;
+
+        if (path_implies_directory(newpath))
+                return -EISDIR;
+
+        /* First, try to link this directly */
+        if (oldpath)
+                r = RET_NERRNO(linkat(olddirfd, oldpath, newdirfd, newpath, 0));
+        else
+                r = link_fd(olddirfd, newdirfd, newpath);
+        if (r >= 0)
+                return 0;
+        if (r != -EEXIST)
+                return r;
+
+        old_fd = xopenat(olddirfd, oldpath, O_PATH|O_CLOEXEC);
+        if (old_fd < 0)
+                return old_fd;
+
+        struct stat old_st;
+        if (fstat(old_fd, &old_st) < 0)
+                return -errno;
+
+        if (S_ISDIR(old_st.st_mode)) /* Don't bother if we are operating on a directory */
+                return -EISDIR;
+
+        struct stat new_st;
+        if (fstatat(newdirfd, newpath, &new_st, AT_SYMLINK_NOFOLLOW) < 0)
+                return -errno;
+
+        if (S_ISDIR(new_st.st_mode)) /* Refuse replacing directories */
+                return -EEXIST;
+
+        if (stat_inode_same(&old_st, &new_st)) /* Already the same inode? Then shortcut this */
+                return 0;
+
+        _cleanup_free_ char *tmp_path = NULL;
+        r = tempfn_random(newpath, /* extra= */ NULL, &tmp_path);
+        if (r < 0)
+                return r;
+
+        r = link_fd(old_fd, newdirfd, tmp_path);
+        if (r < 0) {
+                if (!ERRNO_IS_PRIVILEGE(r))
+                        return r;
+
+                /* If that didn't work due to permissions then go via the path of the dentry */
+                r = RET_NERRNO(linkat(olddirfd, oldpath, newdirfd, tmp_path, 0));
+                if (r < 0)
+                        return r;
+        }
+
+        r = RET_NERRNO(renameat(newdirfd, tmp_path, newdirfd, newpath));
+        if (r < 0) {
+                (void) unlinkat(newdirfd, tmp_path, /* flags= */ 0);
+                return r;
+        }
+
+        return 0;
 }

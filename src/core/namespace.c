@@ -47,6 +47,7 @@
 #include "tmpfile-util.h"
 #include "umask-util.h"
 #include "user-util.h"
+#include "vpick.h"
 
 #define DEV_MOUNT_OPTIONS (MS_NOSUID|MS_STRICTATIME|MS_NOEXEC)
 
@@ -500,8 +501,23 @@ static int append_extensions(
         /* First, prepare a mount for each image, but these won't be visible to the unit, instead
          * they will be mounted in our propagate directory, and used as a source for the overlay. */
         for (size_t i = 0; i < n; i++) {
+                _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
                 _cleanup_free_ char *mount_point = NULL;
                 const MountImage *m = mount_images + i;
+
+                r = path_pick(/* toplevel_path= */ NULL,
+                              /* toplevel_fd= */ AT_FDCWD,
+                              m->source,
+                              &pick_filter_image_raw,
+                              PICK_ARCHITECTURE|PICK_TRIES,
+                              &result);
+                if (r < 0)
+                        return r;
+                if (!result.path)
+                        return log_debug_errno(
+                                        SYNTHETIC_ERRNO(ENOENT),
+                                        "No matching entry in .v/ directory %s found.",
+                                        m->source);
 
                 if (asprintf(&mount_point, "%s/%zu", extension_dir, i) < 0)
                         return -ENOMEM;
@@ -524,7 +540,7 @@ static int append_extensions(
                         .path_malloc = TAKE_PTR(mount_point),
                         .image_options_const = m->mount_options,
                         .ignore = m->ignore_enoent,
-                        .source_const = m->source,
+                        .source_malloc = TAKE_PTR(result.path),
                         .mode = MOUNT_EXTENSION_IMAGE,
                         .has_prefix = true,
                 };
@@ -534,7 +550,8 @@ static int append_extensions(
          * Bind mount them in the same location as the ExtensionImages, so that we
          * can check that they are valid trees (extension-release.d). */
         STRV_FOREACH(extension_directory, extension_directories) {
-                _cleanup_free_ char *mount_point = NULL, *source = NULL;
+                _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
+                _cleanup_free_ char *mount_point = NULL;
                 const char *e = *extension_directory;
                 bool ignore_enoent = false;
 
@@ -551,9 +568,19 @@ static int append_extensions(
                 if (startswith(e, "+"))
                         e++;
 
-                source = strdup(e);
-                if (!source)
-                        return -ENOMEM;
+                r = path_pick(/* toplevel_path= */ NULL,
+                              /* toplevel_fd= */ AT_FDCWD,
+                              e,
+                              &pick_filter_image_dir,
+                              PICK_ARCHITECTURE|PICK_TRIES,
+                              &result);
+                if (r < 0)
+                        return r;
+                if (!result.path)
+                        return log_debug_errno(
+                                        SYNTHETIC_ERRNO(ENOENT),
+                                        "No matching entry in .v/ directory %s found.",
+                                        e);
 
                 for (size_t j = 0; hierarchies && hierarchies[j]; ++j) {
                         char *prefixed_hierarchy = path_join(mount_point, hierarchies[j]);
@@ -571,7 +598,7 @@ static int append_extensions(
 
                 *me = (MountEntry) {
                         .path_malloc = TAKE_PTR(mount_point),
-                        .source_malloc = TAKE_PTR(source),
+                        .source_malloc = TAKE_PTR(result.path),
                         .mode = MOUNT_EXTENSION_DIRECTORY,
                         .ignore = ignore_enoent,
                         .has_prefix = true,
@@ -626,8 +653,7 @@ static int append_tmpfs_mounts(MountList *ml, const TemporaryFileSystem *tmpfs, 
                         return log_debug_errno(r, "Failed to parse mount option '%s': %m", str);
 
                 ro = flags & MS_RDONLY;
-                if (ro)
-                        flags ^= MS_RDONLY;
+                flags &= ~MS_RDONLY;
 
                 MountEntry *me = mount_list_extend(ml);
                 if (!me)
@@ -876,42 +902,41 @@ static void drop_outside_root(MountList *ml, const char *root_directory) {
         ml->n_mounts = t - ml->mounts;
 }
 
-static int clone_device_node(
-                const char *d,
-                const char *temporary_mount,
-                bool *make_devnode) {
-
+static int clone_device_node(const char *node, const char *temporary_mount, bool *make_devnode) {
         _cleanup_free_ char *sl = NULL;
-        const char *dn, *bn, *t;
+        const char *dn, *bn;
         struct stat st;
         int r;
 
-        if (stat(d, &st) < 0) {
+        assert(node);
+        assert(path_is_absolute(node));
+        assert(temporary_mount);
+        assert(make_devnode);
+
+        if (stat(node, &st) < 0) {
                 if (errno == ENOENT) {
-                        log_debug_errno(errno, "Device node '%s' to clone does not exist, ignoring.", d);
+                        log_debug_errno(errno, "Device node '%s' to clone does not exist.", node);
                         return -ENXIO;
                 }
 
-                return log_debug_errno(errno, "Failed to stat() device node '%s' to clone, ignoring: %m", d);
+                return log_debug_errno(errno, "Failed to stat() device node '%s' to clone: %m", node);
         }
 
-        if (!S_ISBLK(st.st_mode) &&
-            !S_ISCHR(st.st_mode))
-                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Device node '%s' to clone is not a device node, ignoring.",
-                                       d);
+        r = stat_verify_device_node(&st);
+        if (r < 0)
+                return log_debug_errno(r, "Cannot clone device node '%s': %m", node);
 
-        dn = strjoina(temporary_mount, d);
+        dn = strjoina(temporary_mount, node);
 
         /* First, try to create device node properly */
         if (*make_devnode) {
-                mac_selinux_create_file_prepare(d, st.st_mode);
+                mac_selinux_create_file_prepare(node, st.st_mode);
                 r = mknod(dn, st.st_mode, st.st_rdev);
                 mac_selinux_create_file_clear();
                 if (r >= 0)
                         goto add_symlink;
                 if (errno != EPERM)
-                        return log_debug_errno(errno, "mknod failed for %s: %m", d);
+                        return log_debug_errno(errno, "Failed to mknod '%s': %m", node);
 
                 /* This didn't work, let's not try this again for the next iterations. */
                 *make_devnode = false;
@@ -921,17 +946,17 @@ static int clone_device_node(
          * Do not prepare device-node SELinux label (see issue 13762) */
         r = mknod(dn, S_IFREG, 0);
         if (r < 0 && errno != EEXIST)
-                return log_debug_errno(errno, "mknod() fallback failed for '%s': %m", d);
+                return log_debug_errno(errno, "Failed to mknod dummy device node for '%s': %m", node);
 
         /* Fallback to bind-mounting: The assumption here is that all used device nodes carry standard
          * properties. Specifically, the devices nodes we bind-mount should either be owned by root:root or
          * root:tty (e.g. /dev/tty, /dev/ptmx) and should not carry ACLs. */
-        r = mount_nofollow_verbose(LOG_DEBUG, d, dn, NULL, MS_BIND, NULL);
+        r = mount_nofollow_verbose(LOG_DEBUG, node, dn, NULL, MS_BIND, NULL);
         if (r < 0)
                 return r;
 
 add_symlink:
-        bn = path_startswith(d, "/dev/");
+        bn = path_startswith(node, "/dev/");
         if (!bn)
                 return 0;
 
@@ -944,14 +969,27 @@ add_symlink:
 
         (void) mkdir_parents(sl, 0755);
 
-        t = strjoina("../", bn);
+        const char *t = strjoina("../", bn);
         if (symlink(t, sl) < 0)
                 log_debug_errno(errno, "Failed to symlink '%s' to '%s', ignoring: %m", t, sl);
 
         return 0;
 }
 
-static char *settle_runtime_dir(RuntimeScope scope) {
+static int bind_mount_device_dir(const char *temporary_mount, const char *dir) {
+        const char *t;
+
+        assert(temporary_mount);
+        assert(dir);
+        assert(path_is_absolute(dir));
+
+        t = strjoina(temporary_mount, dir);
+
+        (void) mkdir(t, 0755);
+        return mount_nofollow_verbose(LOG_DEBUG, dir, t, NULL, MS_BIND, NULL);
+}
+
+static char* settle_runtime_dir(RuntimeScope scope) {
         char *runtime_dir;
 
         if (scope != RUNTIME_SCOPE_USER)
@@ -992,8 +1030,8 @@ static int mount_private_dev(MountEntry *m, RuntimeScope scope) {
                 "/dev/urandom\0"
                 "/dev/tty\0";
 
-        _cleanup_free_ char *temporary_mount = NULL;
-        const char *dev = NULL, *devpts = NULL, *devshm = NULL, *devhugepages = NULL, *devmqueue = NULL, *devlog = NULL, *devptmx = NULL;
+        _cleanup_(rmdir_and_freep) char *temporary_mount = NULL;
+        _cleanup_(umount_and_rmdir_and_freep) char *dev = NULL;
         bool can_mknod = true;
         int r;
 
@@ -1003,67 +1041,56 @@ static int mount_private_dev(MountEntry *m, RuntimeScope scope) {
         if (r < 0)
                 return r;
 
-        dev = strjoina(temporary_mount, "/dev");
+        dev = path_join(temporary_mount, "dev");
+        if (!dev)
+                return -ENOMEM;
+
         (void) mkdir(dev, 0755);
         r = mount_nofollow_verbose(LOG_DEBUG, "tmpfs", dev, "tmpfs", DEV_MOUNT_OPTIONS, "mode=0755" TMPFS_LIMITS_PRIVATE_DEV);
         if (r < 0)
-                goto fail;
+                return r;
 
         r = label_fix_full(AT_FDCWD, dev, "/dev", 0);
-        if (r < 0) {
-                log_debug_errno(r, "Failed to fix label of '%s' as /dev: %m", dev);
-                goto fail;
-        }
-
-        devpts = strjoina(temporary_mount, "/dev/pts");
-        (void) mkdir(devpts, 0755);
-        r = mount_nofollow_verbose(LOG_DEBUG, "/dev/pts", devpts, NULL, MS_BIND, NULL);
         if (r < 0)
-                goto fail;
+                return log_debug_errno(r, "Failed to fix label of '%s' as /dev/: %m", dev);
+
+        r = bind_mount_device_dir(temporary_mount, "/dev/pts");
+        if (r < 0)
+                return r;
 
         /* /dev/ptmx can either be a device node or a symlink to /dev/pts/ptmx.
          * When /dev/ptmx a device node, /dev/pts/ptmx has 000 permissions making it inaccessible.
          * Thus, in that case make a clone.
          * In nspawn and other containers it will be a symlink, in that case make it a symlink. */
         r = is_symlink("/dev/ptmx");
-        if (r < 0) {
-                log_debug_errno(r, "Failed to detect whether /dev/ptmx is a symlink or not: %m");
-                goto fail;
-        } else if (r > 0) {
-                devptmx = strjoina(temporary_mount, "/dev/ptmx");
-                if (symlink("pts/ptmx", devptmx) < 0) {
-                        r = log_debug_errno(errno, "Failed to create a symlink '%s' to pts/ptmx: %m", devptmx);
-                        goto fail;
-                }
+        if (r < 0)
+                return log_debug_errno(r, "Failed to detect whether /dev/ptmx is a symlink or not: %m");
+        if (r > 0) {
+                const char *devptmx = strjoina(temporary_mount, "/dev/ptmx");
+                if (symlink("pts/ptmx", devptmx) < 0)
+                        return log_debug_errno(errno, "Failed to create symlink '%s' to pts/ptmx: %m", devptmx);
         } else {
                 r = clone_device_node("/dev/ptmx", temporary_mount, &can_mknod);
                 if (r < 0)
-                        goto fail;
+                        return r;
         }
 
-        devshm = strjoina(temporary_mount, "/dev/shm");
-        (void) mkdir(devshm, 0755);
-        r = mount_nofollow_verbose(LOG_DEBUG, "/dev/shm", devshm, NULL, MS_BIND, NULL);
+        r = bind_mount_device_dir(temporary_mount, "/dev/shm");
         if (r < 0)
-                goto fail;
+                return r;
 
-        devmqueue = strjoina(temporary_mount, "/dev/mqueue");
-        (void) mkdir(devmqueue, 0755);
-        (void) mount_nofollow_verbose(LOG_DEBUG, "/dev/mqueue", devmqueue, NULL, MS_BIND, NULL);
+        FOREACH_STRING(d, "/dev/mqueue", "/dev/hugepages")
+                (void) bind_mount_device_dir(temporary_mount, d);
 
-        devhugepages = strjoina(temporary_mount, "/dev/hugepages");
-        (void) mkdir(devhugepages, 0755);
-        (void) mount_nofollow_verbose(LOG_DEBUG, "/dev/hugepages", devhugepages, NULL, MS_BIND, NULL);
-
-        devlog = strjoina(temporary_mount, "/dev/log");
+        const char *devlog = strjoina(temporary_mount, "/dev/log");
         if (symlink("/run/systemd/journal/dev-log", devlog) < 0)
-                log_debug_errno(errno, "Failed to create a symlink '%s' to /run/systemd/journal/dev-log, ignoring: %m", devlog);
+                log_debug_errno(errno, "Failed to create symlink '%s' to /run/systemd/journal/dev-log, ignoring: %m", devlog);
 
         NULSTR_FOREACH(d, devnodes) {
                 r = clone_device_node(d, temporary_mount, &can_mknod);
                 /* ENXIO means the *source* is not a device file, skip creation in that case */
                 if (r < 0 && r != -ENXIO)
-                        goto fail;
+                        return r;
         }
 
         r = dev_setup(temporary_mount, UID_INVALID, GID_INVALID);
@@ -1081,31 +1108,10 @@ static int mount_private_dev(MountEntry *m, RuntimeScope scope) {
 
         r = mount_nofollow_verbose(LOG_DEBUG, dev, mount_entry_path(m), NULL, MS_MOVE, NULL);
         if (r < 0)
-                goto fail;
-
-        (void) rmdir(dev);
-        (void) rmdir(temporary_mount);
+                return r;
+        dev = rmdir_and_free(dev); /* Mount is successfully moved, do not umount() */
 
         return 1;
-
-fail:
-        if (devpts)
-                (void) umount_verbose(LOG_DEBUG, devpts, UMOUNT_NOFOLLOW);
-
-        if (devshm)
-                (void) umount_verbose(LOG_DEBUG, devshm, UMOUNT_NOFOLLOW);
-
-        if (devhugepages)
-                (void) umount_verbose(LOG_DEBUG, devhugepages, UMOUNT_NOFOLLOW);
-
-        if (devmqueue)
-                (void) umount_verbose(LOG_DEBUG, devmqueue, UMOUNT_NOFOLLOW);
-
-        (void) umount_verbose(LOG_DEBUG, dev, UMOUNT_NOFOLLOW);
-        (void) rmdir(dev);
-        (void) rmdir(temporary_mount);
-
-        return r;
 }
 
 static int mount_bind_dev(const MountEntry *m) {
@@ -1118,7 +1124,7 @@ static int mount_bind_dev(const MountEntry *m) {
 
         (void) mkdir_p_label(mount_entry_path(m), 0755);
 
-        r = path_is_mount_point(mount_entry_path(m), NULL, 0);
+        r = path_is_mount_point(mount_entry_path(m));
         if (r < 0)
                 return log_debug_errno(r, "Unable to determine whether /dev is already mounted: %m");
         if (r > 0) /* make this a NOP if /dev is already a mount point */
@@ -1138,7 +1144,7 @@ static int mount_bind_sysfs(const MountEntry *m) {
 
         (void) mkdir_p_label(mount_entry_path(m), 0755);
 
-        r = path_is_mount_point(mount_entry_path(m), NULL, 0);
+        r = path_is_mount_point(mount_entry_path(m));
         if (r < 0)
                 return log_debug_errno(r, "Unable to determine whether /sys is already mounted: %m");
         if (r > 0) /* make this a NOP if /sys is already a mount point */
@@ -1185,7 +1191,7 @@ static int mount_private_apivfs(
                 /* When we do not have enough privileges to mount a new instance, fall back to use an
                  * existing mount. */
 
-                r = path_is_mount_point(entry_path, /* root = */ NULL, /* flags = */ 0);
+                r = path_is_mount_point(entry_path);
                 if (r < 0)
                         return log_debug_errno(r, "Unable to determine whether '%s' is already mounted: %m", entry_path);
                 if (r > 0)
@@ -1300,7 +1306,7 @@ static int mount_run(const MountEntry *m) {
 
         assert(m);
 
-        r = path_is_mount_point(mount_entry_path(m), NULL, 0);
+        r = path_is_mount_point(mount_entry_path(m));
         if (r < 0 && r != -ENOENT)
                 return log_debug_errno(r, "Unable to determine whether /run is already mounted: %m");
         if (r > 0) /* make this a NOP if /run is already a mount point */
@@ -1354,7 +1360,7 @@ static int mount_image(
                 if (r < 0)
                         return log_debug_errno(r, "Failed to acquire 'os-release' data of OS tree '%s': %m", empty_to_root(root_directory));
                 if (isempty(host_os_release_id))
-                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "'ID' field not found or empty in 'os-release' data of OS tree '%s': %m", empty_to_root(root_directory));
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "'ID' field not found or empty in 'os-release' data of OS tree '%s'.", empty_to_root(root_directory));
         }
 
         r = verity_dissect_and_mount(
@@ -1448,6 +1454,8 @@ static int follow_symlink(
         _cleanup_free_ char *target = NULL;
         int r;
 
+        assert(m);
+
         /* Let's chase symlinks, but only one step at a time. That's because depending where the symlink points we
          * might need to change the order in which we mount stuff. Hence: let's normalize piecemeal, and do one step at
          * a time by specifying CHASE_STEP. This function returns 0 if we resolved one step, and > 0 if we reached the
@@ -1469,7 +1477,7 @@ static int follow_symlink(
 
         mount_entry_consume_prefix(m, TAKE_PTR(target));
 
-        m->n_followed ++;
+        m->n_followed++;
 
         return 0;
 }
@@ -1524,7 +1532,7 @@ static int apply_one_mount(
                 r = mode_to_inaccessible_node(runtime_dir, target.st_mode, &inaccessible);
                 if (r < 0)
                         return log_debug_errno(SYNTHETIC_ERRNO(ELOOP),
-                                               "File type not supported for inaccessible mounts. Note that symlinks are not allowed");
+                                               "File type not supported for inaccessible mounts. Note that symlinks are not allowed.");
                 what = inaccessible;
                 break;
         }
@@ -1534,7 +1542,7 @@ static int apply_one_mount(
         case MOUNT_READ_WRITE_IMPLICIT:
         case MOUNT_EXEC:
         case MOUNT_NOEXEC:
-                r = path_is_mount_point(mount_entry_path(m), root_directory, 0);
+                r = path_is_mount_point_full(mount_entry_path(m), root_directory, /* flags = */ 0);
                 if (r == -ENOENT && m->ignore)
                         return 0;
                 if (r < 0)
@@ -1575,7 +1583,7 @@ static int apply_one_mount(
                 if (r < 0)
                         return log_debug_errno(r, "Failed to acquire 'os-release' data of OS tree '%s': %m", empty_to_root(root_directory));
                 if (isempty(host_os_release_id))
-                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "'ID' field not found or empty in 'os-release' data of OS tree '%s': %m", empty_to_root(root_directory));
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "'ID' field not found or empty in 'os-release' data of OS tree '%s'.", empty_to_root(root_directory));
 
                 r = load_extension_release_pairs(mount_entry_source(m), class, extension_name, /* relax_extension_release_check= */ false, &extension_release);
                 if (r == -ENOENT && m->ignore)
@@ -1588,13 +1596,13 @@ static int apply_one_mount(
                                 host_os_release_id,
                                 host_os_release_version_id,
                                 host_os_release_level,
-                                /* host_extension_scope */ NULL, /* Leave empty, we need to accept both system and portable */
+                                /* host_extension_scope = */ NULL, /* Leave empty, we need to accept both system and portable */
                                 extension_release,
                                 class);
-                if (r == 0)
-                        return log_debug_errno(SYNTHETIC_ERRNO(ESTALE), "Directory %s extension-release metadata does not match the root's", extension_name);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to compare directory %s extension-release metadata with the root's os-release: %m", extension_name);
+                if (r == 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(ESTALE), "Directory %s extension-release metadata does not match the root's.", extension_name);
 
                 _fallthrough_;
         }
@@ -1687,11 +1695,11 @@ static int apply_one_mount(
                         (void) mkdir_parents(mount_entry_path(m), 0755);
 
                         q = make_mount_point_inode_from_path(what, mount_entry_path(m), 0755);
-                        if (q < 0) {
-                                if (q != -EEXIST) // FIXME: this shouldn't be logged at LOG_WARNING, but be bubbled up, and logged there to avoid duplicate logging
-                                        log_warning_errno(q, "Failed to create destination mount point node '%s', ignoring: %m",
-                                                          mount_entry_path(m));
-                        } else
+                        if (q < 0 && q != -EEXIST)
+                                // FIXME: this shouldn't be logged at LOG_WARNING, but be bubbled up, and logged there to avoid duplicate logging
+                                log_warning_errno(q, "Failed to create destination mount point node '%s', ignoring: %m",
+                                                  mount_entry_path(m));
+                        else
                                 try_again = true;
                 }
 
@@ -2049,9 +2057,9 @@ static bool root_read_only(
 }
 
 static bool home_read_only(
-                char** read_only_paths,
-                char** inaccessible_paths,
-                char** empty_directories,
+                char * const *read_only_paths,
+                char * const *inaccessible_paths,
+                char * const *empty_directories,
                 const BindMount *bind_mounts,
                 size_t n_bind_mounts,
                 const TemporaryFileSystem *temporary_filesystems,
@@ -2070,13 +2078,13 @@ static bool home_read_only(
             prefixed_path_strv_contains(empty_directories, "/home"))
                 return true;
 
-        for (size_t i = 0; i < n_temporary_filesystems; i++)
-                if (path_equal(temporary_filesystems[i].path, "/home"))
+        FOREACH_ARRAY(i, temporary_filesystems, n_temporary_filesystems)
+                if (path_equal(i->path, "/home"))
                         return true;
 
         /* If /home is overmounted with some dir from the host it's not writable. */
-        for (size_t i = 0; i < n_bind_mounts; i++)
-                if (path_equal(bind_mounts[i].destination, "/home"))
+        FOREACH_ARRAY(i, bind_mounts, n_bind_mounts)
+                if (path_equal(i->destination, "/home"))
                         return true;
 
         return false;
@@ -2088,6 +2096,7 @@ int setup_namespace(const NamespaceParameters *p, char **error_path) {
         _cleanup_(dissected_image_unrefp) DissectedImage *dissected_image = NULL;
         _cleanup_strv_free_ char **hierarchies = NULL;
         _cleanup_(mount_list_done) MountList ml = {};
+        _cleanup_close_ int userns_fd = -EBADF;
         bool require_prefix = false;
         const char *root;
         DissectImageFlags dissect_image_flags =
@@ -2099,7 +2108,8 @@ int setup_namespace(const NamespaceParameters *p, char **error_path) {
                 DISSECT_IMAGE_USR_NO_ROOT |
                 DISSECT_IMAGE_GROWFS |
                 DISSECT_IMAGE_ADD_PARTITION_DEVICES |
-                DISSECT_IMAGE_PIN_PARTITION_DEVICES;
+                DISSECT_IMAGE_PIN_PARTITION_DEVICES |
+                DISSECT_IMAGE_ALLOW_USERSPACE_VERITY;
         int r;
 
         assert(p);
@@ -2123,40 +2133,57 @@ int setup_namespace(const NamespaceParameters *p, char **error_path) {
 
                 SET_FLAG(dissect_image_flags, DISSECT_IMAGE_NO_PARTITION_TABLE, p->verity && p->verity->data_path);
 
-                r = loop_device_make_by_path(
-                                p->root_image,
-                                FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_DEVICE_READ_ONLY) ? O_RDONLY : -1 /* < 0 means writable if possible, read-only as fallback */,
-                                /* sector_size= */ UINT32_MAX,
-                                FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN,
-                                LOCK_SH,
-                                &loop_device);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to create loop device for root image: %m");
+                if (p->runtime_scope == RUNTIME_SCOPE_SYSTEM) {
+                        /* In system mode we mount directly */
 
-                r = dissect_loop_device(
-                                loop_device,
-                                p->verity,
-                                p->root_image_options,
-                                p->root_image_policy,
-                                dissect_image_flags,
-                                &dissected_image);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to dissect image: %m");
+                        r = loop_device_make_by_path(
+                                        p->root_image,
+                                        FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_DEVICE_READ_ONLY) ? O_RDONLY : -1 /* < 0 means writable if possible, read-only as fallback */,
+                                        /* sector_size= */ UINT32_MAX,
+                                        FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN,
+                                        LOCK_SH,
+                                        &loop_device);
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to create loop device for root image: %m");
 
-                r = dissected_image_load_verity_sig_partition(
-                                dissected_image,
-                                loop_device->fd,
-                                p->verity);
-                if (r < 0)
-                        return r;
+                        r = dissect_loop_device(
+                                        loop_device,
+                                        p->verity,
+                                        p->root_image_options,
+                                        p->root_image_policy,
+                                        dissect_image_flags,
+                                        &dissected_image);
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to dissect image: %m");
 
-                r = dissected_image_decrypt(
-                                dissected_image,
-                                NULL,
-                                p->verity,
-                                dissect_image_flags);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to decrypt dissected image: %m");
+                        r = dissected_image_load_verity_sig_partition(
+                                        dissected_image,
+                                        loop_device->fd,
+                                        p->verity);
+                        if (r < 0)
+                                return r;
+
+                        r = dissected_image_decrypt(
+                                        dissected_image,
+                                        NULL,
+                                        p->verity,
+                                        dissect_image_flags);
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to decrypt dissected image: %m");
+                } else {
+                        userns_fd = namespace_open_by_type(NAMESPACE_USER);
+                        if (userns_fd < 0)
+                                return log_debug_errno(userns_fd, "Failed to open our own user namespace: %m");
+
+                        r = mountfsd_mount_image(
+                                        p->root_image,
+                                        userns_fd,
+                                        p->root_image_policy,
+                                        dissect_image_flags,
+                                        &dissected_image);
+                        if (r < 0)
+                                return r;
+                }
         }
 
         if (p->root_directory)
@@ -2520,16 +2547,18 @@ int setup_namespace(const NamespaceParameters *p, char **error_path) {
                                 root,
                                 /* uid_shift= */ UID_INVALID,
                                 /* uid_range= */ UID_INVALID,
-                                /* userns_fd= */ -EBADF,
+                                userns_fd,
                                 dissect_image_flags);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to mount root image: %m");
 
                 /* Now release the block device lock, so that udevd is free to call BLKRRPART on the device
                  * if it likes. */
-                r = loop_device_flock(loop_device, LOCK_UN);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to release lock on loopback block device: %m");
+                if (loop_device) {
+                        r = loop_device_flock(loop_device, LOCK_UN);
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to release lock on loopback block device: %m");
+                }
 
                 r = dissected_image_relinquish(dissected_image);
                 if (r < 0)
@@ -2538,7 +2567,7 @@ int setup_namespace(const NamespaceParameters *p, char **error_path) {
         } else if (p->root_directory) {
 
                 /* A root directory is specified. Turn its directory into bind mount, if it isn't one yet. */
-                r = path_is_mount_point(root, NULL, AT_SYMLINK_FOLLOW);
+                r = path_is_mount_point_full(root, /* root = */ NULL, AT_SYMLINK_FOLLOW);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to detect that %s is a mount point or not: %m", root);
                 if (r == 0) {
@@ -2595,9 +2624,9 @@ int setup_namespace(const NamespaceParameters *p, char **error_path) {
 void bind_mount_free_many(BindMount *b, size_t n) {
         assert(b || n == 0);
 
-        for (size_t i = 0; i < n; i++) {
-                free(b[i].source);
-                free(b[i].destination);
+        FOREACH_ARRAY(i, b, n) {
+                free(i->source);
+                free(i->destination);
         }
 
         free(b);
@@ -2625,7 +2654,7 @@ int bind_mount_add(BindMount **b, size_t *n, const BindMount *item) {
 
         *b = c;
 
-        c[(*n) ++] = (BindMount) {
+        c[(*n)++] = (BindMount) {
                 .source = TAKE_PTR(s),
                 .destination = TAKE_PTR(d),
                 .read_only = item->read_only,
@@ -2694,7 +2723,7 @@ int mount_image_add(MountImage **m, size_t *n, const MountImage *item) {
 
         *m = c;
 
-        c[(*n) ++] = (MountImage) {
+        c[(*n)++] = (MountImage) {
                 .source = TAKE_PTR(s),
                 .destination = TAKE_PTR(d),
                 .mount_options = TAKE_PTR(options),
@@ -2745,7 +2774,7 @@ int temporary_filesystem_add(
 
         *t = c;
 
-        c[(*n) ++] = (TemporaryFileSystem) {
+        c[(*n)++] = (TemporaryFileSystem) {
                 .path = TAKE_PTR(p),
                 .options = TAKE_PTR(o),
         };

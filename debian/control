@@ -11,11 +11,12 @@ Standards-Version: 4.7.0
 Rules-Requires-Root: no
 Vcs-Git: https://salsa.debian.org/systemd-team/systemd.git
 Vcs-Browser: https://salsa.debian.org/systemd-team/systemd
-Homepage: https://www.freedesktop.org/wiki/Software/systemd
+Homepage: https://systemd.io
 Build-Depends: debhelper-compat (= 13),
                debhelper (>= 13.11.6),
                dh-exec,
                dh-package-notes,
+               dh-sequence-dlopenlibdeps <!stage1>,
                dh-sequence-installnss,
                dh-sequence-installsysusers,
                pkgconf,
@@ -23,9 +24,11 @@ Build-Depends: debhelper-compat (= 13),
                docbook-xsl <!nodoc>,
                docbook-xml <!nodoc>,
                meson (>= 0.60.0),
-               clang <pkg.systemd.upstream !stage1>,
-               linux-headers-generic <pkg.systemd.upstream !stage1>,
-               libbpf-dev <pkg.systemd.upstream !stage1>,
+               rsync | meson (>= 1.3.0~),
+               clang [amd64 arm64 ppc64el riscv64 s390x] <!pkg.systemd.nobpf !stage1>,
+               linux-headers-generic [amd64 arm64 ppc64el riscv64 s390x] <!pkg.systemd.nobpf !stage1>,
+               libbpf-dev [amd64 arm64 ppc64el riscv64 s390x] <!pkg.systemd.nobpf !stage1>,
+               bpftool [amd64 arm64 ppc64el riscv64 s390x] <!pkg.systemd.nobpf !stage1 !pkg.systemd.upstream>,
                linux-tools-generic <pkg.systemd.upstream> | bpftool <pkg.systemd.upstream>,
                gettext,
                gperf,
@@ -64,7 +67,7 @@ Build-Depends: debhelper-compat (= 13),
                libqrencode-dev <!stage1>,
                libxen-dev [amd64 arm64 armhf] <!stage1>,
                libpwquality-dev <!stage1>,
-               libarchive-dev <pkg.systemd.upstream !stage1>,
+               libarchive-dev <!stage1>,
                linux-base <!nocheck>,
                acl <!nocheck>,
                python3:native,
@@ -72,6 +75,7 @@ Build-Depends: debhelper-compat (= 13),
                python3-lxml:native,
                python3-pefile:native <!stage1 !nocheck> <!stage1 !noinsttest>,
                python3-pyelftools [amd64 i386 arm64 armhf riscv64] <!stage1>,
+               jq [amd64 arm64] <!stage1 !pkg.systemd.upstream>,
                python3-pyparsing <!nocheck>,
                python3-evdev:native <!nocheck>,
                tzdata-legacy <!nocheck> | tzdata (<< 2024a-1) <!nocheck>,
@@ -86,30 +90,24 @@ Architecture: linux-any
 Multi-Arch: foreign
 Priority: important
 Recommends: default-dbus-system-bus | dbus-system-bus,
+            linux-sysctl-defaults,
             systemd-timesyncd | time-daemon,
+            systemd-cryptsetup,
+            ${dlopen:Recommends},
 Suggests: systemd-container,
           systemd-homed,
           systemd-userdbd,
           systemd-boot,
           systemd-resolved,
-          libbpf1,
-          libfido2-1,
-          libip4tc2,
-          libkmod2,
-          libp11-kit0,
-          libpwquality1,
-          libqrencode4,
-          libtss2-esys-3.0.2-0,
-          libtss2-mu-4.0.1-0,
-          libtss2-rc0,
+          systemd-repart,
           libtss2-tcti-device0,
           polkitd,
+          ${dlopen:Suggests},
 Pre-Depends: ${shlibs:Pre-Depends},
              ${misc:Pre-Depends}
 Depends: ${shlibs:Depends},
          ${misc:Depends},
          libsystemd0 (= ${binary:Version}),
-         systemd-dev (>= ${source:Version}),
          mount,
 Conflicts: consolekit,
            libpam-ck-connector,
@@ -118,7 +116,7 @@ Conflicts: consolekit,
            droidian-quirks-brightness (< 79),
 Breaks: less (<< 563),
         sicherboot (<< 0.1.6),
-        dracut (<< 059-5),
+        dracut-core (<< 102-2~),
 Provides: systemd-sysusers (= ${binary:Version}),
           systemd-tmpfiles (= ${binary:Version}),
 Description: system and service manager
@@ -140,6 +138,9 @@ Conflicts: sysvinit-core,
            systemd-shim,
            initscripts,
            orphan-sysvinit-scripts,
+           sysv-rc,
+           insserv,
+           startpar,
            bfh-container (<< 20211009-22~),
            molly-guard (<< 0.8.2~),
            progress-linux-container (<< 20221002-11~),
@@ -163,6 +164,9 @@ Depends: ${shlibs:Depends},
          systemd,
          default-dbus-system-bus | dbus-system-bus
 Recommends: libnss-mymachines,
+            ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
+Conflicts: systemd (<< 256-2~),
 Description: systemd container/nspawn tools
  This package provides systemd's tools for nspawn and container/VM management:
   * systemd-nspawn
@@ -177,6 +181,8 @@ Multi-Arch: foreign
 Depends: ${shlibs:Depends},
          ${misc:Depends},
          systemd,
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: tools for sending and receiving remote journal logs
  This package provides tools for sending and receiving remote journal logs:
   * systemd-journal-remote
@@ -190,7 +196,8 @@ Multi-Arch: foreign
 Depends: ${shlibs:Depends},
          ${misc:Depends},
          systemd
-Recommends: libdw1
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Conflicts: core-dump-handler
 Replaces: core-dump-handler
 Provides: core-dump-handler
@@ -206,6 +213,8 @@ Priority: standard
 Depends: ${shlibs:Depends},
          ${misc:Depends},
          systemd
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Conflicts: time-daemon
 Replaces: time-daemon
 Provides: time-daemon
@@ -219,6 +228,9 @@ Depends: ${shlibs:Depends},
          ${misc:Depends},
          systemd (= ${binary:Version}),
          python3,
+         python3-psutil,
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Build-Profiles: <!noinsttest>
 Description: tests for systemd
  This package contains the test binaries. Those binaries are primarily used
@@ -236,6 +248,8 @@ Depends: ${shlibs:Depends},
          default-dbus-system-bus | dbus-system-bus,
          systemd-sysv
 Recommends: dbus-user-session,
+            ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Provides: logind (= ${binary:Version}), default-logind (= ${binary:Version})
 Conflicts: libpam-elogind-compat,
 Description: system and service manager - PAM module
@@ -252,6 +266,8 @@ Multi-Arch: same
 Pre-Depends: ${misc:Pre-Depends}
 Depends: ${shlibs:Depends},
          ${misc:Depends},
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: nss module providing fallback resolution for the current hostname
  This package contains a plugin for the Name Service Switch, providing host
  name resolution for the locally configured system hostname as returned by
@@ -272,6 +288,8 @@ Pre-Depends: ${misc:Pre-Depends}
 Depends: ${shlibs:Depends},
          ${misc:Depends},
          systemd-container (= ${binary:Version}),
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: nss module to resolve hostnames for local container instances
  nss-mymachines is a plugin for the GNU Name Service Switch (NSS) functionality
  of the GNU C Library (glibc) providing hostname resolution for local containers
@@ -287,6 +305,8 @@ Pre-Depends: ${misc:Pre-Depends}
 Depends: ${shlibs:Depends},
          ${misc:Depends},
          systemd-resolved (= ${binary:Version}),
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: nss module to resolve names via systemd-resolved
  nss-resolve is a plugin for the GNU Name Service Switch (NSS) functionality
  of the GNU C Library (glibc) providing DNS and LLMNR resolution to programs via
@@ -302,6 +322,8 @@ Pre-Depends: ${misc:Pre-Depends}
 Depends: ${shlibs:Depends},
          ${misc:Depends},
          systemd (= ${binary:Version}),
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: nss module providing dynamic user and group name resolution
  nss-systemd is a plug-in module for the GNU Name Service Switch (NSS)
  functionality of the GNU C Library (glibc), providing UNIX user and group name
@@ -317,7 +339,8 @@ Multi-Arch: same
 Section: libs
 Depends: ${shlibs:Depends},
          ${misc:Depends}
-Recommends: libgcrypt20,
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: systemd utility library
  This library provides APIs to interface with various system components such as
  the system journal, the system service manager, D-Bus and more.
@@ -342,6 +365,8 @@ Section: libs
 Pre-Depends: ${misc:Pre-Depends}
 Depends: ${shlibs:Depends},
          ${misc:Depends}
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: systemd shared private library
  This internal shared library provides common code used by various systemd
  components. It is supposed to decrease memory and disk footprint.
@@ -356,8 +381,9 @@ Depends: ${shlibs:Depends},
          ${misc:Depends},
          libkmod2,
          libudev1 (= ${binary:Version}),
-         systemd-dev (>= ${source:Version}),
          s390-tools [s390],
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 # DEP17 M7: moving files between / and /usr, and between packages, so use Conflicts:
 Conflicts: systemd (<< 255~rc1-4~),
 Replaces: systemd (<< 255~rc1-4~),
@@ -372,6 +398,8 @@ Multi-Arch: same
 Pre-Depends: ${misc:Pre-Depends}
 Depends: ${shlibs:Depends},
          ${misc:Depends}
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: libudev shared library
  This library provides APIs to introspect and enumerate devices on the local
  system.
@@ -425,6 +453,8 @@ Replaces: systemd-sysusers,
 Provides: systemd-sysusers (= ${binary:Version})
 Depends: ${shlibs:Depends},
          ${misc:Depends},
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: standalone sysusers binary for use in non-systemd systems
  Standalone sysusers binary with minimal dependencies.
  This package conflicts with the main systemd package and is meant for use in
@@ -439,15 +469,31 @@ Replaces: systemd-tmpfiles,
 Provides: systemd-tmpfiles (= ${binary:Version})
 Depends: ${shlibs:Depends},
          ${misc:Depends},
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: standalone tmpfiles binary for use in non-systemd systems
  Standalone tmpfiles binary with minimal dependencies.
  This package conflicts with the main systemd package and is meant for use in
  non-systemd systems.
 
+Package: systemd-standalone-shutdown
+Architecture: linux-any
+Conflicts: systemd,
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
+Description: standalone shutdown binary for use in exitrds
+ Standalone shutdown binary with minimal dependencies.
+ This package conflicts with the main systemd package and is meant for use in
+ minimal exitrd images. Not intended for normal systems.
+
 Package: systemd-oomd
 Architecture: linux-any
 Depends: ${shlibs:Depends},
          ${misc:Depends},
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Breaks: systemd (<< 250.2-2~)
 Replaces: systemd (<< 250.2-2~)
 Description: userspace out-of-memory (OOM) killer
@@ -462,6 +508,8 @@ Depends: ${shlibs:Depends},
          ${misc:Depends},
          libnss-systemd (= ${binary:Version}),
          systemd (= ${binary:Version}),
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: dynamic user/group manager
  systemd-userdbd is a system service that multiplexes user/group lookups to all
  local services that provide JSON user/group record definitions to the system.
@@ -479,7 +527,8 @@ Depends: ${shlibs:Depends},
          systemd-userdbd (= ${binary:Version}),
          systemd (= ${binary:Version}),
          libpam-runtime,
-         libpwquality1,
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
 Description: home area manager
  systemd-homed is a system service designed to manage home directories. This
  package includes the homed service, a PAM module to automatically mount home
@@ -492,9 +541,10 @@ Depends: ${shlibs:Depends},
          ${misc:Depends},
          systemd-boot-efi (= ${binary:Version}),
 Recommends: efibootmgr,
+            ${dlopen:Recommends},
 Suggests: systemd-ukify,
-Breaks: systemd (<< 251.2-3~)
-Replaces: systemd (<< 251.2-3~)
+          ${dlopen:Suggests},
+Conflicts: systemd (<< 256-2~), systemd-boot-efi (<< 256-2~),
 Description: simple UEFI boot manager - tools and services
  systemd-boot (short: sd-boot) is a simple UEFI boot manager. It provides a
  textual menu to select the entry to boot and an editor for the kernel command
@@ -520,8 +570,24 @@ Description: simple UEFI boot manager - EFI binaries
  .
  This package contains the EFI binaries.
 
+Package: systemd-boot-efi-amd64-signed-template
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends},
+Build-Profiles: <!stage1 !pkg.systemd.upstream>
+Description: Template for signed systemd-boot-efi package (amd64)
+ This package is used to control code signing by the Debian signing
+ service (amd64 variant).
+
+Package: systemd-boot-efi-arm64-signed-template
+Architecture: arm64
+Depends: ${shlibs:Depends}, ${misc:Depends},
+Build-Profiles: <!stage1 !pkg.systemd.upstream>
+Description: Template for signed systemd-boot-efi package (arm64)
+ This package is used to control code signing by the Debian signing
+ service (arm64 variant).
+
 Package: systemd-ukify
-Build-Profiles: <!stage1>
+Build-Profiles: <!stage1 !pkg.systemd.noukify>
 Architecture: all
 Multi-Arch: foreign
 Depends: ${misc:Depends},
@@ -545,7 +611,9 @@ Depends: ${shlibs:Depends},
          default-dbus-system-bus | dbus-system-bus
 Recommends: libnss-myhostname,
             libnss-resolve,
+            ${dlopen:Recommends},
 Suggests: polkitd,
+          ${dlopen:Suggests},
 Provides: resolvconf
 Conflicts: resolvconf
 Replaces: resolvconf,
@@ -574,3 +642,27 @@ Description: systemd development files
  are different from the libsystemd's and libudev's pkg-config files, which can
  still be found in the respective dev packages, but instead provide data such as
  the installation directories for units, and more.
+
+Package: systemd-repart
+Architecture: linux-any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
+Conflicts: systemd (<< 256-2~),
+Description: Provides the systemd-repart utility
+ systemd-repart is a configuration-driven system partitioning tool. It follows
+ the Discoverable Partitions Specification and provides support for encryption
+ and dm-verity among other things.
+
+Package: systemd-cryptsetup
+Build-Profiles: <!stage1>
+Architecture: linux-any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+Recommends: ${dlopen:Recommends},
+Suggests: ${dlopen:Suggests},
+Conflicts: systemd (<< 256-2~),
+Description: Provides cryptsetup, integritysetup and veritysetup utilities
+ Utilities and units that integrated cryptsetup/integritysetup/veritysetup
+ support in systemd.

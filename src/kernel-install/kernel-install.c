@@ -19,6 +19,7 @@
 #include "fs-util.h"
 #include "id128-util.h"
 #include "image-policy.h"
+#include "kernel-config.h"
 #include "kernel-image.h"
 #include "main-func.h"
 #include "mkdir.h"
@@ -49,6 +50,7 @@ static bool arg_legend = true;
 STATIC_DESTRUCTOR_REGISTER(arg_esp_path, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_xbootldr_path, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
 
 typedef enum Action {
@@ -150,37 +152,37 @@ static int context_copy(const Context *source, Context *ret) {
                         return copy.rfd;
         }
 
-        r = strdup_or_null(source->layout_other, &copy.layout_other);
+        r = strdup_to(&copy.layout_other, source->layout_other);
         if (r < 0)
                 return r;
-        r = strdup_or_null(source->conf_root, &copy.conf_root);
+        r = strdup_to(&copy.conf_root, source->conf_root);
         if (r < 0)
                 return r;
-        r = strdup_or_null(source->boot_root, &copy.boot_root);
+        r = strdup_to(&copy.boot_root, source->boot_root);
         if (r < 0)
                 return r;
-        r = strdup_or_null(source->entry_token, &copy.entry_token);
+        r = strdup_to(&copy.entry_token, source->entry_token);
         if (r < 0)
                 return r;
-        r = strdup_or_null(source->entry_dir, &copy.entry_dir);
+        r = strdup_to(&copy.entry_dir, source->entry_dir);
         if (r < 0)
                 return r;
-        r = strdup_or_null(source->version, &copy.version);
+        r = strdup_to(&copy.version, source->version);
         if (r < 0)
                 return r;
-        r = strdup_or_null(source->kernel, &copy.kernel);
+        r = strdup_to(&copy.kernel, source->kernel);
         if (r < 0)
                 return r;
         r = strv_copy_unless_empty(source->initrds, &copy.initrds);
         if (r < 0)
                 return r;
-        r = strdup_or_null(source->initrd_generator, &copy.initrd_generator);
+        r = strdup_to(&copy.initrd_generator, source->initrd_generator);
         if (r < 0)
                 return r;
-        r = strdup_or_null(source->uki_generator, &copy.uki_generator);
+        r = strdup_to(&copy.uki_generator, source->uki_generator);
         if (r < 0)
                 return r;
-        r = strdup_or_null(source->staging_area, &copy.staging_area);
+        r = strdup_to(&copy.staging_area, source->staging_area);
         if (r < 0)
                 return r;
         r = strv_copy_unless_empty(source->plugins, &copy.plugins);
@@ -430,79 +432,30 @@ static int context_load_environment(Context *c) {
         return 0;
 }
 
-static int context_ensure_conf_root(Context *c) {
-        int r;
-
-        assert(c);
-
-        if (c->conf_root)
-                return 0;
-
-        r = chaseat(c->rfd, "/etc/kernel", CHASE_AT_RESOLVE_IN_ROOT, &c->conf_root, /* ret_fd = */ NULL);
-        if (r < 0)
-                log_debug_errno(r, "Failed to chase /etc/kernel, ignoring: %m");
-
-        return 0;
-}
-
-static int context_load_install_conf_one(Context *c, const char *path) {
-        _cleanup_fclose_ FILE *f = NULL;
-        _cleanup_free_ char
-                *conf = NULL, *machine_id = NULL, *boot_root = NULL, *layout = NULL,
-                *initrd_generator = NULL, *uki_generator = NULL;
-        int r;
-
-        assert(c);
-        assert(path);
-
-        conf = path_join(path, "install.conf");
-        if (!conf)
-                return log_oom();
-
-        r = chase_and_fopenat_unlocked(c->rfd, conf, CHASE_AT_RESOLVE_IN_ROOT, "re", NULL, &f);
-        if (r == -ENOENT)
-                return 0;
-        if (r < 0)
-                return log_error_errno(r, "Failed to chase %s: %m", conf);
-
-        log_debug("Loading %s…", conf);
-
-        r = parse_env_file(f, conf,
-                           "MACHINE_ID",       &machine_id,
-                           "BOOT_ROOT",        &boot_root,
-                           "layout",           &layout,
-                           "initrd_generator", &initrd_generator,
-                           "uki_generator",    &uki_generator);
-        if (r < 0)
-                return log_error_errno(r, "Failed to parse '%s': %m", conf);
-
-        (void) context_set_machine_id(c, machine_id, conf);
-        (void) context_set_boot_root(c, boot_root, conf);
-        (void) context_set_layout(c, layout, conf);
-        (void) context_set_initrd_generator(c, initrd_generator, conf);
-        (void) context_set_uki_generator(c, uki_generator, conf);
-
-        log_debug("Loaded %s.", conf);
-        return 1;
-}
-
 static int context_load_install_conf(Context *c) {
+        _cleanup_free_ char *machine_id = NULL, *boot_root = NULL, *layout = NULL,
+                            *initrd_generator = NULL, *uki_generator = NULL;
         int r;
 
         assert(c);
 
-        if (c->conf_root) {
-                r = context_load_install_conf_one(c, c->conf_root);
-                if (r != 0)
-                        return r;
-        }
+        r = load_kernel_install_conf(arg_root,
+                                     c->conf_root,
+                                     &machine_id,
+                                     &boot_root,
+                                     &layout,
+                                     &initrd_generator,
+                                     &uki_generator);
+        if (r <= 0)
+                return r;
 
-        STRV_FOREACH(p, STRV_MAKE("/etc/kernel", "/usr/lib/kernel")) {
-                r = context_load_install_conf_one(c, *p);
-                if (r != 0)
-                        return r;
-        }
+        (void) context_set_machine_id(c, machine_id, "config");
+        (void) context_set_boot_root(c, boot_root, "config");
+        (void) context_set_layout(c, layout, "config");
+        (void) context_set_initrd_generator(c, initrd_generator, "config");
+        (void) context_set_uki_generator(c, uki_generator, "config");
 
+        log_debug("Loaded config.");
         return 0;
 }
 
@@ -525,7 +478,7 @@ static int context_load_machine_info(Context *c) {
         if (r < 0 && r != -ENXIO)
                 log_warning_errno(r, "Failed to read $KERNEL_INSTALL_READ_MACHINE_INFO, assuming yes: %m");
         if (r == 0) {
-                log_debug("Skipping to read /etc/machine-info.");
+                log_debug("Skipping reading of /etc/machine-info.");
                 return 0;
         }
 
@@ -732,10 +685,6 @@ static int context_init(Context *c) {
         if (r < 0)
                 return r;
 
-        r = context_ensure_conf_root(c);
-        if (r < 0)
-                return r;
-
         r = context_load_install_conf(c);
         if (r < 0)
                 return r;
@@ -819,7 +768,7 @@ static int context_ensure_layout(Context *c) {
         if (!entry_token_path)
                 return log_oom();
 
-        r = is_dir_full(c->rfd, entry_token_path, /* follow = */ false);
+        r = is_dir_at(c->rfd, entry_token_path, /* follow = */ false);
         if (r < 0 && r != -ENOENT)
                 return log_error_errno(r, "Failed to check if '%s' is a directory: %m", entry_token_path);
         if (r > 0) {
@@ -996,11 +945,10 @@ static int context_build_arguments(Context *c) {
                         return log_oom();
 
         } else if (c->action == ACTION_INSPECT) {
-                r = strv_extend(&a, c->kernel ?: "[KERNEL_IMAGE]");
-                if (r < 0)
-                        return log_oom();
-
-                r = strv_extend(&a, "[INITRD...]");
+                r = strv_extend_many(
+                                &a,
+                                c->kernel ?: "[KERNEL_IMAGE]",
+                                "[INITRD...]");
                 if (r < 0)
                         return log_oom();
         }
@@ -1184,7 +1132,7 @@ static int verb_add(int argc, char *argv[], void *userdata) {
         assert(argv);
 
         if (arg_root)
-                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "'add' does not support --root=.");
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "'add' does not support --root= or --image=.");
 
         if (bypass())
                 return 0;
@@ -1223,14 +1171,17 @@ static int verb_add_all(int argc, char *argv[], void *userdata) {
 
         assert(argv);
 
+        if (arg_root)
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "'add-all' does not support --root= or --image=.");
+
         if (bypass())
                 return 0;
 
         c->action = ACTION_ADD;
 
-        fd = open("/usr/lib/modules", O_DIRECTORY|O_RDONLY|O_CLOEXEC);
+        fd = chase_and_openat(c->rfd, "/usr/lib/modules", CHASE_AT_RESOLVE_IN_ROOT, O_DIRECTORY|O_RDONLY|O_CLOEXEC, NULL);
         if (fd < 0)
-                return log_error_errno(fd, "Failed to open /usr/lib/modules/: %m");
+                return log_error_errno(fd, "Failed to open %s/usr/lib/modules/: %m", strempty(arg_root));
 
         _cleanup_free_ DirectoryEntries *de = NULL;
         r = readdir_all(fd, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT, &de);
@@ -1238,15 +1189,10 @@ static int verb_add_all(int argc, char *argv[], void *userdata) {
                 return log_error_errno(r, "Failed to numerate /usr/lib/modules/ contents: %m");
 
         FOREACH_ARRAY(d, de->entries, de->n_entries) {
-
-                _cleanup_free_ char *j = path_join("/usr/lib/modules/", (*d)->d_name);
-                if (!j)
-                        return log_oom();
-
                 r = dirent_ensure_type(fd, *d);
                 if (r < 0) {
                         if (r != -ENOENT) /* don't log if just gone by now */
-                                log_debug_errno(r, "Failed to check if '%s' is a directory, ignoring: %m", j);
+                                log_debug_errno(r, "Failed to check if '%s/usr/lib/modules/%s' is a directory, ignoring: %m", strempty(arg_root), (*d)->d_name);
                         continue;
                 }
 
@@ -1259,7 +1205,7 @@ static int verb_add_all(int argc, char *argv[], void *userdata) {
 
                 if (faccessat(fd, fn, F_OK, AT_SYMLINK_NOFOLLOW) < 0) {
                         if (errno != ENOENT)
-                                log_debug_errno(errno, "Failed to check if '/usr/lib/modules/%s/vmlinuz' exists, ignoring: %m", (*d)->d_name);
+                                log_debug_errno(errno, "Failed to check if '%s/usr/lib/modules/%s/vmlinuz' exists, ignoring: %m", strempty(arg_root), (*d)->d_name);
 
                         log_notice("Not adding version '%s', because kernel image not found.", (*d)->d_name);
                         continue;
@@ -1271,6 +1217,8 @@ static int verb_add_all(int argc, char *argv[], void *userdata) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to copy execution context: %m");
 
+                /* do_add() will look up the path in the correct root directory so we don't need to prefix it
+                 * with arg_root here. */
                 _cleanup_free_ char *full = path_join("/usr/lib/modules/", fn);
                 if (!full)
                         return log_oom();
@@ -1311,7 +1259,7 @@ static int verb_remove(int argc, char *argv[], void *userdata) {
         assert(argv);
 
         if (arg_root)
-                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "'remove' does not support --root=.");
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "'remove' does not support --root= or --image=.");
 
         if (argc > 2)
                 log_debug("Too many arguments specified. 'kernel-install remove' takes only kernel version. "
@@ -1449,12 +1397,13 @@ static int verb_inspect(int argc, char *argv[], void *userdata) {
 }
 
 static int verb_list(int argc, char *argv[], void *userdata) {
+        Context *c = ASSERT_PTR(userdata);
         _cleanup_close_ int fd = -EBADF;
         int r;
 
-        fd = open("/usr/lib/modules", O_DIRECTORY|O_RDONLY|O_CLOEXEC);
+        fd = chase_and_openat(c->rfd, "/usr/lib/modules", CHASE_AT_RESOLVE_IN_ROOT, O_DIRECTORY|O_RDONLY|O_CLOEXEC, NULL);
         if (fd < 0)
-                return log_error_errno(fd, "Failed to open /usr/lib/modules/: %m");
+                return log_error_errno(fd, "Failed to open %s/usr/lib/modules/: %m", strempty(arg_root));
 
         _cleanup_free_ DirectoryEntries *de = NULL;
         r = readdir_all(fd, RECURSE_DIR_SORT|RECURSE_DIR_IGNORE_DOT, &de);
@@ -1470,7 +1419,6 @@ static int verb_list(int argc, char *argv[], void *userdata) {
         table_set_align_percent(table, table_get_cell(table, 0, 1), 100);
 
         FOREACH_ARRAY(d, de->entries, de->n_entries) {
-
                 _cleanup_free_ char *j = path_join("/usr/lib/modules/", (*d)->d_name);
                 if (!j)
                         return log_oom();
@@ -1478,7 +1426,7 @@ static int verb_list(int argc, char *argv[], void *userdata) {
                 r = dirent_ensure_type(fd, *d);
                 if (r < 0) {
                         if (r != -ENOENT) /* don't log if just gone by now */
-                                log_debug_errno(r, "Failed to check if '%s' is a directory, ignoring: %m", j);
+                                log_debug_errno(r, "Failed to check if '%s/%s' is a directory, ignoring: %m", strempty(arg_root), j);
                         continue;
                 }
 
@@ -1492,7 +1440,7 @@ static int verb_list(int argc, char *argv[], void *userdata) {
                 bool exists;
                 if (faccessat(fd, fn, F_OK, AT_SYMLINK_NOFOLLOW) < 0) {
                         if (errno != ENOENT)
-                                log_debug_errno(errno, "Failed to check if '/usr/lib/modules/%s/vmlinuz' exists, ignoring: %m", (*d)->d_name);
+                                log_debug_errno(errno, "Failed to check if '%s/usr/lib/modules/%s/vmlinuz' exists, ignoring: %m", strempty(arg_root), (*d)->d_name);
 
                         exists = false;
                 } else
@@ -1519,7 +1467,7 @@ static int help(void) {
                 return log_oom();
 
         printf("%1$s [OPTIONS...] COMMAND ...\n\n"
-               "%5$sAdd and remove kernel and initrd images to and from /boot/%6$s\n"
+               "%5$sAdd and remove kernel and initrd images to and from the boot partition.%6$s\n"
                "\n%3$sUsage:%4$s\n"
                "  kernel-install [OPTIONS...] add [[[KERNEL-VERSION] KERNEL-IMAGE] [INITRD ...]]\n"
                "  kernel-install [OPTIONS...] add-all\n"
@@ -1718,7 +1666,8 @@ static int run(int argc, char* argv[]) {
                                 DISSECT_IMAGE_GENERIC_ROOT |
                                 DISSECT_IMAGE_REQUIRE_ROOT |
                                 DISSECT_IMAGE_RELAX_VAR_CHECK |
-                                DISSECT_IMAGE_VALIDATE_OS,
+                                DISSECT_IMAGE_VALIDATE_OS |
+                                DISSECT_IMAGE_ALLOW_USERSPACE_VERITY,
                                 &mounted_dir,
                                 /* ret_dir_fd= */ NULL,
                                 &loop_device);

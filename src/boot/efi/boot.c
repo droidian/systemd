@@ -741,20 +741,25 @@ static bool menu_run(
                         lines = xnew(char16_t *, config->n_entries + 1);
 
                         for (size_t i = 0; i < config->n_entries; i++) {
-                                size_t j, padding;
+                                size_t width = line_width - MIN(strlen16(config->entries[i]->title_show), line_width);
+                                size_t padding = width / 2;
+                                bool odd = width % 2;
 
-                                lines[i] = xnew(char16_t, line_width + 1);
-                                padding = (line_width - MIN(strlen16(config->entries[i]->title_show), line_width)) / 2;
+                                /* Make sure there is space for => */
+                                padding = MAX((size_t) 2, padding);
 
-                                for (j = 0; j < padding; j++)
-                                        lines[i][j] = ' ';
+                                size_t print_width = MIN(
+                                                strlen16(config->entries[i]->title_show),
+                                                line_width - padding * 2);
 
-                                for (size_t k = 0; config->entries[i]->title_show[k] != '\0' && j < line_width; j++, k++)
-                                        lines[i][j] = config->entries[i]->title_show[k];
+                                assert((padding + 1) <= INT_MAX);
+                                assert(print_width <= INT_MAX);
 
-                                for (; j < line_width; j++)
-                                        lines[i][j] = ' ';
-                                lines[i][line_width] = '\0';
+                                lines[i] = xasprintf(
+                                                "%*ls%.*ls%*ls",
+                                                (int) padding, u"",
+                                                (int) print_width, config->entries[i]->title_show,
+                                                odd ? (int) (padding + 1) : (int) padding, u"");
                         }
                         lines[config->n_entries] = NULL;
 
@@ -874,6 +879,7 @@ static bool menu_run(
 
                 switch (key) {
                 case KEYPRESS(0, SCAN_UP, 0):
+                case KEYPRESS(0, SCAN_VOLUME_UP, 0):  /* Handle phones/tablets that only have a volume up/down rocker + power key (and otherwise just touchscreen input) */
                 case KEYPRESS(0, 0, 'k'):
                 case KEYPRESS(0, 0, 'K'):
                         if (idx_highlight > 0)
@@ -881,6 +887,7 @@ static bool menu_run(
                         break;
 
                 case KEYPRESS(0, SCAN_DOWN, 0):
+                case KEYPRESS(0, SCAN_VOLUME_DOWN, 0):
                 case KEYPRESS(0, 0, 'j'):
                 case KEYPRESS(0, 0, 'J'):
                         if (idx_highlight < config->n_entries-1)
@@ -918,9 +925,10 @@ static bool menu_run(
 
                 case KEYPRESS(0, 0, '\n'):
                 case KEYPRESS(0, 0, '\r'):
-                case KEYPRESS(0, SCAN_F3, 0): /* EZpad Mini 4s firmware sends malformed events */
-                case KEYPRESS(0, SCAN_F3, '\r'): /* Teclast X98+ II firmware sends malformed events */
+                case KEYPRESS(0, SCAN_F3, 0):      /* EZpad Mini 4s firmware sends malformed events */
+                case KEYPRESS(0, SCAN_F3, '\r'):   /* Teclast X98+ II firmware sends malformed events */
                 case KEYPRESS(0, SCAN_RIGHT, 0):
+                case KEYPRESS(0, SCAN_SUSPEND, 0): /* Handle phones/tablets with only a power key + volume up/down rocker (and otherwise just touchscreen input) */
                         action = ACTION_RUN;
                         break;
 
@@ -2288,7 +2296,7 @@ static EFI_STATUS initrd_prepare(
                         continue;
 
                 size_t new_size, read_size = info->FileSize;
-                if (__builtin_add_overflow(size, read_size, &new_size))
+                if (!ADD_SAFE(&new_size, size, read_size))
                         return EFI_OUT_OF_RESOURCES;
                 initrd = xrealloc(initrd, size, new_size);
 
@@ -2369,7 +2377,16 @@ static EFI_STATUS image_start(
         /* If we had to append an initrd= entry to the command line, we have to pass it, and measure it.
          * Otherwise, only pass/measure it if it is not implicit anyway (i.e. embedded into the UKI or
          * so). */
-        char16_t *options = options_initrd ?: entry->options_implied ? NULL : entry->options;
+        _cleanup_free_ char16_t *options = xstrdup16(options_initrd ?: entry->options_implied ? NULL : entry->options);
+
+        if (entry->type == LOADER_LINUX && !is_confidential_vm()) {
+                const char *extra = smbios_find_oem_string("io.systemd.boot.kernel-cmdline-extra");
+                if (extra) {
+                        _cleanup_free_ char16_t *tmp = TAKE_PTR(options), *extra16 = xstr8_to_16(extra);
+                        options = xasprintf("%ls %ls", tmp, extra16);
+                }
+        }
+
         if (options) {
                 loaded_image->LoadOptions = options;
                 loaded_image->LoadOptionsSize = strsize16(options);
@@ -2466,7 +2483,7 @@ static EFI_STATUS secure_boot_discover_keys(Config *config, EFI_FILE *root_dir) 
         EFI_STATUS err;
         _cleanup_(file_closep) EFI_FILE *keys_basedir = NULL;
 
-        if (secure_boot_mode() != SECURE_BOOT_SETUP)
+        if (!IN_SET(secure_boot_mode(), SECURE_BOOT_SETUP, SECURE_BOOT_AUDIT))
                 return EFI_SUCCESS;
 
         /* the lack of a 'keys' directory is not fatal and is silently ignored */

@@ -2,6 +2,7 @@
 
 #include "af-list.h"
 #include "alloc-util.h"
+#include "bus-common-errors.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-unit-util.h"
@@ -494,14 +495,14 @@ static int bus_append_nft_set(sd_bus_message *m, const char *field, const char *
                 if (r == 0)
                         break;
                 if (isempty(tuple))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s", field);
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s.", field);
 
                 q = tuple;
-                r = extract_many_words(&q, ":", EXTRACT_CUNESCAPE, &source_str, &nfproto_str, &table, &set, NULL);
+                r = extract_many_words(&q, ":", EXTRACT_CUNESCAPE, &source_str, &nfproto_str, &table, &set);
                 if (r == -ENOMEM)
                         return log_oom();
                 if (r != 4 || !isempty(q))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s", field);
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s.", field);
 
                 assert(source_str);
                 assert(nfproto_str);
@@ -510,11 +511,11 @@ static int bus_append_nft_set(sd_bus_message *m, const char *field, const char *
 
                 source = nft_set_source_from_string(source_str);
                 if (!IN_SET(source, NFT_SET_SOURCE_CGROUP, NFT_SET_SOURCE_USER, NFT_SET_SOURCE_GROUP))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s", field);
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s.", field);
 
                 nfproto = nfproto_from_string(nfproto_str);
                 if (nfproto < 0 || !nft_identifier_valid(table) || !nft_identifier_valid(set))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s", field);
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse %s.", field);
 
                 r = sd_bus_message_append(m, "(iiss)", source, nfproto, table, set);
                 if (r < 0)
@@ -562,6 +563,7 @@ static int bus_append_cgroup_property(sd_bus_message *m, const char *field, cons
 
         if (STR_IN_SET(field, "CPUAccounting",
                               "MemoryAccounting",
+                              "MemoryZSwapWriteback",
                               "IOAccounting",
                               "BlockIOAccounting",
                               "TasksAccounting",
@@ -678,8 +680,7 @@ static int bus_append_cgroup_property(sd_bus_message *m, const char *field, cons
                 else {
                         r = parse_permyriad_unbounded(eq);
                         if (r == 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(ERANGE),
-                                                       "CPU quota too small.");
+                                return log_error_errno(SYNTHETIC_ERRNO(ERANGE), "CPU quota too small.");
                         if (r < 0)
                                 return log_error_errno(r, "CPU quota '%s' invalid.", eq);
 
@@ -1213,7 +1214,7 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                                 _cleanup_free_ void *decoded = NULL;
                                 size_t decoded_size;
 
-                                r = unbase64mem(p, SIZE_MAX, &decoded, &decoded_size);
+                                r = unbase64mem(p, &decoded, &decoded_size);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to base64 decode encrypted credential: %m");
 
@@ -1400,7 +1401,7 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                 _cleanup_free_ void *decoded = NULL;
                 size_t sz;
 
-                r = unbase64mem(eq, SIZE_MAX, &decoded, &sz);
+                r = unbase64mem(eq, &decoded, &sz);
                 if (r < 0)
                         return log_error_errno(r, "Failed to decode base64 data '%s': %m", eq);
 
@@ -1787,11 +1788,11 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                         return bus_append_string(m, "RootHashPath", eq);
 
                 /* We have a roothash to decode, eg: RootHash=012345789abcdef */
-                r = unhexmem(eq, strlen(eq), &roothash_decoded, &roothash_decoded_size);
+                r = unhexmem(eq, &roothash_decoded, &roothash_decoded_size);
                 if (r < 0)
                         return log_error_errno(r, "Failed to decode RootHash= '%s': %m", eq);
                 if (roothash_decoded_size < sizeof(sd_id128_t))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "RootHash= '%s' is too short: %m", eq);
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "RootHash= '%s' is too short.", eq);
 
                 return bus_append_byte_array(m, field, roothash_decoded, roothash_decoded_size);
         }
@@ -1806,10 +1807,10 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                         return bus_append_string(m, "RootHashSignaturePath", eq);
 
                 if (!(value = startswith(eq, "base64:")))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to decode RootHashSignature= '%s', not a path but doesn't start with 'base64:': %m", eq);
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to decode RootHashSignature= '%s', not a path but doesn't start with 'base64:'.", eq);
 
                 /* We have a roothash signature to decode, eg: RootHashSignature=base64:012345789abcdef */
-                r = unbase64mem(value, strlen(value), &roothash_sig_decoded, &roothash_sig_decoded_size);
+                r = unbase64mem(value, &roothash_sig_decoded, &roothash_sig_decoded_size);
                 if (r < 0)
                         return log_error_errno(r, "Failed to decode RootHashSignature= '%s': %m", eq);
 
@@ -1894,7 +1895,7 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                                 break;
 
                         q = tuple;
-                        r = extract_many_words(&q, ":", EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS, &first, &second, NULL);
+                        r = extract_many_words(&q, ":", EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS, &first, &second);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse MountImages= property: %s", eq);
                         if (r == 0)
@@ -1926,7 +1927,7 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                         for (;;) {
                                 _cleanup_free_ char *partition = NULL, *mount_options = NULL;
 
-                                r = extract_many_words(&q, ":", EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS, &partition, &mount_options, NULL);
+                                r = extract_many_words(&q, ":", EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS, &partition, &mount_options);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to parse MountImages= property: %s", eq);
                                 if (r == 0)
@@ -2027,7 +2028,7 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                         for (;;) {
                                 _cleanup_free_ char *partition = NULL, *mount_options = NULL;
 
-                                r = extract_many_words(&q, ":", EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS, &partition, &mount_options, NULL);
+                                r = extract_many_words(&q, ":", EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS, &partition, &mount_options);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to parse ExtensionImages= property: %s", eq);
                                 if (r == 0)
@@ -2088,7 +2089,7 @@ static int bus_append_execute_property(sd_bus_message *m, const char *field, con
                                 break;
 
                         const char *t = tuple;
-                        r = extract_many_words(&t, ":", EXTRACT_UNQUOTE|EXTRACT_DONT_COALESCE_SEPARATORS, &source, &destination, NULL);
+                        r = extract_many_words(&t, ":", EXTRACT_UNQUOTE|EXTRACT_DONT_COALESCE_SEPARATORS, &source, &destination);
                         if (r <= 0)
                                 return log_error_errno(r ?: SYNTHETIC_ERRNO(EINVAL), "Failed to parse argument: %m");
 
@@ -2449,6 +2450,7 @@ static int bus_append_socket_property(sd_bus_message *m, const char *field, cons
                               "Transparent",
                               "Broadcast",
                               "PassCredentials",
+                              "PassFileDescriptorsToExec",
                               "PassSecurity",
                               "PassPacketInfo",
                               "ReusePort",
@@ -2643,6 +2645,7 @@ static int bus_append_unit_property(sd_bus_message *m, const char *field, const 
         if (unit_dependency_from_string(field) >= 0 ||
             STR_IN_SET(field, "Documentation",
                               "RequiresMountsFor",
+                              "WantsMountsFor",
                               "Markers"))
                 return bus_append_strv(m, field, eq, EXTRACT_UNQUOTE);
 
@@ -2819,13 +2822,13 @@ int bus_append_unit_property_assignment_many(sd_bus_message *m, UnitType t, char
         return 0;
 }
 
-int bus_append_scope_pidref(sd_bus_message *m, const PidRef *pidref) {
+int bus_append_scope_pidref(sd_bus_message *m, const PidRef *pidref, bool allow_pidfd) {
         assert(m);
 
         if (!pidref_is_set(pidref))
                 return -ESRCH;
 
-        if (pidref->fd >= 0)
+        if (pidref->fd >= 0 && allow_pidfd)
                 return sd_bus_message_append(
                                 m, "(sv)",
                                 "PIDFDs", "ah", 1, pidref->fd);
@@ -2934,5 +2937,109 @@ int bus_service_manager_reload(sd_bus *bus) {
         if (r < 0)
                 return log_error_errno(r, "Failed to reload service manager: %s", bus_error_message(&error, r));
 
+        return 0;
+}
+
+typedef struct UnitFreezer {
+        char *name;
+        sd_bus *bus;
+} UnitFreezer;
+
+/* Wait for 60 seconds at maximum for freezer operation */
+#define FREEZE_BUS_CALL_TIMEOUT (60 * USEC_PER_SEC)
+
+UnitFreezer* unit_freezer_free(UnitFreezer *f) {
+        if (!f)
+                return NULL;
+
+        free(f->name);
+        sd_bus_flush_close_unref(f->bus);
+
+        return mfree(f);
+}
+
+int unit_freezer_new(const char *name, UnitFreezer **ret) {
+        _cleanup_(unit_freezer_freep) UnitFreezer *f = NULL;
+        int r;
+
+        assert(name);
+        assert(ret);
+
+        f = new(UnitFreezer, 1);
+        if (!f)
+                return log_oom();
+
+        *f = (UnitFreezer) {
+                .name = strdup(name),
+        };
+        if (!f->name)
+                return log_oom();
+
+        r = bus_connect_system_systemd(&f->bus);
+        if (r < 0)
+                return log_error_errno(r, "Failed to open connection to systemd: %m");
+
+        (void) sd_bus_set_method_call_timeout(f->bus, FREEZE_BUS_CALL_TIMEOUT);
+
+        *ret = TAKE_PTR(f);
+        return 0;
+}
+
+static int unit_freezer_action(UnitFreezer *f, bool freeze) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        int r;
+
+        assert(f);
+        assert(f->name);
+        assert(f->bus);
+
+        r = bus_call_method(f->bus, bus_systemd_mgr,
+                            freeze ? "FreezeUnit" : "ThawUnit",
+                            &error,
+                            /* reply = */ NULL,
+                            "s",
+                            f->name);
+        if (r < 0) {
+                if (sd_bus_error_has_names(&error,
+                                           BUS_ERROR_NO_SUCH_UNIT,
+                                           BUS_ERROR_UNIT_INACTIVE,
+                                           SD_BUS_ERROR_NOT_SUPPORTED)) {
+
+                        log_debug_errno(r, "Skipping freezer for '%s': %s", f->name, bus_error_message(&error, r));
+                        return 0;
+                }
+
+                return log_error_errno(r, "Failed to %s unit '%s': %s",
+                                       freeze ? "freeze" : "thaw", f->name, bus_error_message(&error, r));
+        }
+
+        log_info("Successfully %s unit '%s'.", freeze ? "froze" : "thawed", f->name);
+        return 1;
+}
+
+int unit_freezer_freeze(UnitFreezer *f) {
+        return unit_freezer_action(f, true);
+}
+
+int unit_freezer_thaw(UnitFreezer *f) {
+        return unit_freezer_action(f, false);
+}
+
+int unit_freezer_new_freeze(const char *name, UnitFreezer **ret) {
+        _cleanup_(unit_freezer_freep) UnitFreezer *f = NULL;
+        int r;
+
+        assert(name);
+        assert(ret);
+
+        r = unit_freezer_new(name, &f);
+        if (r < 0)
+                return r;
+
+        r = unit_freezer_freeze(f);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(f);
         return 0;
 }

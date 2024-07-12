@@ -28,7 +28,7 @@ efi_fuzz_template = fuzz_template + efitest_base
 executables += [
         efi_test_template + {
                 'sources' : files('test-bcd.c'),
-                'dependencies' : libzstd,
+                'dependencies' : libzstd_cflags,
                 'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_ZSTD'],
         },
         efi_test_template + {
@@ -63,12 +63,14 @@ foreach ctype : ['color-normal', 'color-entry', 'color-highlight', 'color-edit']
                 'EFI_' + c[1].strip().underscorify().to_upper()))
 endforeach
 
+efi_conf.set_quoted('PROJECT_VERSION', project_major_version)
+efi_conf.set_quoted('VERSION_TAG', version_tag)
+efi_conf.set('PROJECT_URL', conf.get('PROJECT_URL'))
+
 if meson.is_cross_build() and get_option('sbat-distro') == 'auto'
         warning('Auto detection of SBAT information not supported when cross-building, disabling SBAT.')
 elif get_option('sbat-distro') != ''
         efi_conf.set_quoted('SBAT_PROJECT', meson.project_name())
-        efi_conf.set_quoted('PROJECT_VERSION', meson.project_version())
-        efi_conf.set('PROJECT_URL', conf.get('PROJECT_URL'))
         if get_option('sbat-distro-generation') < 1
                 error('SBAT Distro Generation must be a positive integer')
         endif
@@ -209,11 +211,13 @@ if cc.get_id() == 'clang'
 endif
 
 efi_arch_c_args = {
-        'aarch64' : ['-mgeneral-regs-only'],
-        'arm'     : ['-mgeneral-regs-only'],
+        'aarch64'     : ['-mgeneral-regs-only'],
+        'arm'         : ['-mgeneral-regs-only'],
+        # Until -mgeneral-regs-only is supported in LoongArch, use the following option instead:
+        'loongarch64' : ['-mno-lsx', '-mno-lasx'],
         # Pass -m64/32 explicitly to make building on x32 work.
-        'x86_64'  : ['-m64', '-march=x86-64', '-mno-red-zone', '-mgeneral-regs-only'],
-        'x86'     : ['-m32', '-march=i686', '-mgeneral-regs-only', '-malign-double'],
+        'x86_64'      : ['-m64', '-march=x86-64', '-mno-red-zone', '-mgeneral-regs-only'],
+        'x86'         : ['-m32', '-march=i686', '-mgeneral-regs-only', '-malign-double'],
 }
 efi_arch_c_ld_args = {
         # libgcc is not compiled with -fshort-wchar, but it does not use it anyways,
@@ -385,8 +389,8 @@ foreach efi_elf_binary : efi_elf_binaries
                 install_tag : 'systemd-boot',
                 command : [
                         elf2efi_py,
-                        '--version-major=' + meson.project_version(),
-                        '--version-minor=0',
+                        '--version-major=' + project_major_version,
+                        '--version-minor=' + project_minor_version,
                         '--efi-major=1',
                         '--efi-minor=1',
                         '--subsystem=10',

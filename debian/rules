@@ -8,10 +8,21 @@ export LC_ALL = C.UTF-8
 include /usr/share/dpkg/default.mk
 include /usr/share/debhelper/dh_package_notes/package-notes.mk
 
+ifeq (amd64,$(DEB_HOST_ARCH))
+export TEMPLATE_EFI_ARCH=x64
+else ifeq (arm64,$(DEB_HOST_ARCH))
+export TEMPLATE_EFI_ARCH=aa64
+endif
+
+
 ifeq ($(DEB_VENDOR),Ubuntu)
     DEFAULT_NTP_SERVERS = ntp.ubuntu.com
     SUPPORT_URL = http://www.ubuntu.com/support
-    CONFFLAGS_DISTRO =
+    CONFFLAGS_DISTRO = \
+		-Duser-path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+		-Ddefault-llmnr=no \
+		-Ddefault-mdns=no
+
 else
     DEFAULT_NTP_SERVERS = 0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org 3.debian.pool.ntp.org
     SUPPORT_URL = https://www.debian.org/support
@@ -27,11 +38,11 @@ TEST_TIMEOUT_MULTIPLIER = "-t 10"
 # unnecessary rebuilds all the time.
 ifeq (, $(filter pkg.systemd.upstream, $(DEB_BUILD_PROFILES)))
     DH_MISSING ?= --fail-missing
-    GENSYMBOLS_LEVEL = 4
+    GENSYMBOLS_LEVEL ?= 4
     VERSION_TAG = $(DEB_VERSION)
 else
     DH_MISSING ?= --list-missing
-    GENSYMBOLS_LEVEL = 1
+    GENSYMBOLS_LEVEL ?= 1
     VERSION_TAG = $(DEB_VERSION_UPSTREAM)
 endif
 
@@ -74,7 +85,6 @@ CONFFLAGS = \
 	-Dgnutls=disabled \
 	-Dlink-udev-shared=false \
 	-Dlink-systemctl-shared=false \
-	-Dbump-proc-sys-fs-nr-open=false \
 	-Dntp-servers="$(DEFAULT_NTP_SERVERS)" \
 	-Ddns-servers='' \
 	-Dsystem-uid-max=999 \
@@ -83,6 +93,7 @@ CONFFLAGS = \
 	-Dnobody-group=nogroup \
 	-Ddev-kvm-mode=0660 \
 	-Dgroup-render-mode=0660 \
+	-Dsbat-distro-url=https://tracker.debian.org/pkg/systemd \
 	-Drepart=enabled \
 	-Dfdisk=enabled \
 	-Dsysext=true \
@@ -92,6 +103,7 @@ CONFFLAGS = \
 	-Dsysusers=true \
 	-Dinstall-tests=$(if $(filter noinsttest,$(DEB_BUILD_PROFILES)),false,true) \
 	-Dman=$(if $(filter nodoc,$(DEB_BUILD_PROFILES)),disabled,enabled) \
+	-Ddbus-interfaces-dir=$(if $(filter nodoc,$(DEB_BUILD_PROFILES)),no,yes) \
 	-Dtranslations=true \
 	-Dnss-myhostname=true \
 	-Dnss-mymachines=enabled \
@@ -133,7 +145,7 @@ CONFFLAGS += \
 	-Duserdb=true \
 	-Dpcre2=enabled \
 	-Dukify=enabled \
-	-Dbootloader=$(if $(filter x32,$(DEB_HOST_ARCH)),disabled,auto) \
+	-Dbootloader=$(if $(filter amd64 i386 arm64 armhf riscv64,$(DEB_HOST_ARCH)),enabled,disabled) \
 	-Dsysupdate=enabled
 else
 CONFFLAGS += \
@@ -162,13 +174,13 @@ CONFFLAGS += \
 	-Dsysupdate=disabled
 endif
 
-ifneq (, $(filter pkg.systemd.upstream, $(DEB_BUILD_PROFILES)))
+# BPF/BTF are only enabled and usable on a few architectures
+ifeq (, $(filter $(DEB_BUILD_PROFILES), stage1 pkg.systemd.nobpf))
+ifneq (,$(filter $(DEB_TARGET_ARCH), amd64 arm64 ppc64el riscv64 s390x))
 CONFFLAGS += \
 	-Dbpf-framework=enabled \
 	-Dbpf-compiler=clang
 
-# Ubuntu does not yet ship vmlinux.h, generate it at build time for now, until
-# https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2050083 is solved
 ifeq ($(DEB_VENDOR),Ubuntu)
 # Source: https://git.launchpad.net/ubuntu/+source/xdp-tools/tree/debian/rules
 # On Ubuntu, the `bpftool` in path is a shell wrapper pointing at
@@ -186,16 +198,27 @@ bpftool_binary := $(shell find /usr/lib/linux-tools/ -name 'bpftool' -perm /u=x 
 ifneq ($(bpftool_binary),)
 export PATH := $(shell dirname $(bpftool_binary)):$(PATH)
 endif
-CONFFLAGS += -Dvmlinux-h=auto
-else
+endif
+
 # The vmlinux.h we want is in the headers package that linux-headers-ARCH depends on,
 # which itself is the package that provides linux-headers-generic that we build depend on.
-# This is available since Trixie.
+# This is available since Trixie. If we can't find it, default to auto for the upstream CI
+# so that it is generated at build time, or disabled for distribution builds, as we don't
+# want to depend on the buildd kernels.
+ifeq ($(DEB_VENDOR),Ubuntu)
+HEADERS_PACKAGE = $(shell dpkg-query --showformat='$${Depends}' --show linux-headers-generic | sed "s/.*\(linux-headers-.*)\)-generic.*/\1/")
+else
 HEADERS_PACKAGE = $(shell dpkg-query --showformat='$${Depends}' --show linux-headers-$(DEB_HOST_ARCH) | sed "s/.*\(linux-headers-.*-$(DEB_HOST_ARCH)\).*/\1/")
+endif
+
 ifneq ("$(wildcard /usr/src/$(HEADERS_PACKAGE)/vmlinux.h)","")
 CONFFLAGS += -Dvmlinux-h=provided -Dvmlinux-h-path=/usr/src/$(HEADERS_PACKAGE)/vmlinux.h
 else
+ifneq (, $(filter pkg.systemd.upstream, $(DEB_BUILD_PROFILES)))
 CONFFLAGS += -Dvmlinux-h=auto
+else
+CONFFLAGS += -Dvmlinux-h=disabled
+endif
 endif
 endif
 endif
@@ -237,17 +260,20 @@ execute_before_dh_install:
 	rm -f debian/tmp/usr/lib/udev/*.d/README
 	rm -f debian/tmp/usr/lib/sysctl.d/50-default.conf
 	rm -f debian/tmp/etc/X11/xinit/xinitrc.d/50-systemd-user.sh
-	rmdir -p --ignore-fail-on-non-empty debian/tmp/etc/X11/xinit/xinitrc.d/
+	if [ -d debian/tmp/etc/X11/xinit/xinitrc.d/ ]; then \
+		rmdir -p --ignore-fail-on-non-empty debian/tmp/etc/X11/xinit/xinitrc.d/; \
+	fi
 	# remove etc.conf and usr/share/factory for now, we are not using them yet
 	find debian/tmp/ -name etc.conf -print -delete
 	rm -rf debian/tmp/usr/share/factory/
 	# replace upstream sysusers.d/basic.conf with proper users for Debian
-	debian/extra/make-sysusers-basic > debian/tmp/usr/lib/sysusers.d/basic.conf
+	if [ -d debian/tmp/usr/lib/sysusers.d/ ]; then \
+		debian/extra/make-sysusers-basic > debian/tmp/usr/lib/sysusers.d/basic.conf; \
+	fi
 	# remove obsolete compat symlink
 	rm -f debian/tmp/usr/bin/systemd-resolve
-	# we don't want repart and shutdown standalone binaries for now
+	# we don't want the repart standalone binary for now
 	rm -f debian/tmp/usr/bin/systemd-repart.standalone
-	rm -f debian/tmp/usr/lib/systemd/systemd-shutdown.standalone
 	# files shipped by cryptsetup
 ifeq (, $(filter stage1, $(DEB_BUILD_PROFILES)))
 	rm -f debian/tmp/usr/share/man/man5/crypttab.5
@@ -256,23 +282,29 @@ endif
 	find debian/tmp -type d -empty -print
 
 execute_after_dh_install-arch:
-	# we don't want /tmp to be a tmpfs by default
-	mv debian/tmp/usr/lib/systemd/system/tmp.mount debian/systemd/usr/share/systemd/
-	printf '\n[Install]\nWantedBy=local-fs.target\n' >> debian/systemd/usr/share/systemd/tmp.mount
-	rm debian/tmp/usr/lib/systemd/system/local-fs.target.wants/tmp.mount
-
 	# Ubuntu specific files
 ifeq ($(DEB_VENDOR),Ubuntu)
 	install -D --mode=644 debian/extra/udev.py debian/udev/usr/share/apport/package-hooks/udev.py
 	install -D --mode=644 debian/extra/systemd.py debian/systemd/usr/share/apport/package-hooks/systemd.py
 	install --mode=644 debian/extra/rules-ubuntu/*.rules debian/udev/usr/lib/udev/rules.d/
+	install -D --mode=644 debian/extra/resolved.conf.d/cache-no-negative.conf debian/systemd-resolved/usr/lib/systemd/resolved.conf.d/cache-no-negative.conf
 	cp -a debian/extra/units-ubuntu/* debian/systemd/usr/lib/systemd/system/
+endif
+
+ifeq (, $(filter pkg.systemd.upstream, $(DEB_BUILD_PROFILES)))
+ifeq ($(DEB_VENDOR),Debian)
+ifneq ($(TEMPLATE_EFI_ARCH),)
+	debian/extra/gen-signing-template $(DEB_VERSION) $(DEB_HOST_ARCH) $(TEMPLATE_EFI_ARCH)
+endif
+endif
 endif
 
 	# Remove empty directories from /usr/lib.
 	# Those are not strictly needed and can trigger piuparts errors due to
 	# accidential directory removal by dpkg on merged-/usr systems.
-	find debian/systemd/usr/lib -type d -empty -print -delete
+	if [ -d debian/systemd/usr/lib ]; then \
+		find debian/systemd/usr/lib -type d -empty -print -delete; \
+	fi
 
 	# Can be dropped once upstream CI stops running on Jammy, which needs
 	# the old pkla config files, which are created only when building with
@@ -322,4 +354,4 @@ override_dh_makeshlibs:
 override_dh_auto_test:
 
 %:
-	dh $@ --without autoreconf --buildsystem=meson
+	dh $@

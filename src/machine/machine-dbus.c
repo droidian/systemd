@@ -73,11 +73,8 @@ int bus_machine_method_unregister(sd_bus_message *message, void *userdata, sd_bu
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_KILL,
                         "org.freedesktop.machine1.manage-machines",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -106,11 +103,8 @@ int bus_machine_method_terminate(sd_bus_message *message, void *userdata, sd_bus
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_KILL,
                         "org.freedesktop.machine1.manage-machines",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -157,11 +151,8 @@ int bus_machine_method_kill(sd_bus_message *message, void *userdata, sd_bus_erro
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_KILL,
                         "org.freedesktop.machine1.manage-machines",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -241,7 +232,12 @@ int bus_machine_method_get_addresses(sd_bus_message *message, void *userdata, sd
                 if (streq(us, them))
                         return sd_bus_error_setf(error, BUS_ERROR_NO_PRIVATE_NETWORKING, "Machine %s does not use private networking", m->name);
 
-                r = namespace_open(m->leader.pid, NULL, NULL, &netns_fd, NULL, NULL);
+                r = namespace_open(m->leader.pid,
+                                   /* ret_pidns_fd = */ NULL,
+                                   /* ret_mntns_fd = */ NULL,
+                                   &netns_fd,
+                                   /* ret_userns_fd = */ NULL,
+                                   /* ret_root_fd = */ NULL);
                 if (r < 0)
                         return r;
 
@@ -351,6 +347,27 @@ int bus_machine_method_get_addresses(sd_bus_message *message, void *userdata, sd
         return sd_bus_send(NULL, reply, NULL);
 }
 
+int bus_machine_method_get_ssh_info(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        Machine *m = ASSERT_PTR(userdata);
+        int r;
+
+        assert(message);
+
+        r = sd_bus_message_new_method_return(message, &reply);
+        if (r < 0)
+                return r;
+
+        if (!m->ssh_address || !m->ssh_private_key_path)
+                return -ENOENT;
+
+        r = sd_bus_message_append(reply, "ss", m->ssh_address, m->ssh_private_key_path);
+        if (r < 0)
+                return r;
+
+        return sd_bus_send(NULL, reply, NULL);
+}
+
 #define EXIT_NOT_FOUND 2
 
 int bus_machine_method_get_os_release(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -375,7 +392,12 @@ int bus_machine_method_get_os_release(sd_bus_message *message, void *userdata, s
                 _cleanup_fclose_ FILE *f = NULL;
                 pid_t child;
 
-                r = namespace_open(m->leader.pid, &pidns_fd, &mntns_fd, NULL, NULL, &root_fd);
+                r = namespace_open(m->leader.pid,
+                                   &pidns_fd,
+                                   &mntns_fd,
+                                   /* ret_netns_fd = */ NULL,
+                                   /* ret_userns_fd = */ NULL,
+                                   &root_fd);
                 if (r < 0)
                         return r;
 
@@ -449,11 +471,8 @@ int bus_machine_method_open_pty(sd_bus_message *message, void *userdata, sd_bus_
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-open-pty" : "org.freedesktop.machine1.open-pty",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -541,11 +560,8 @@ int bus_machine_method_open_login(sd_bus_message *message, void *userdata, sd_bu
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-login" : "org.freedesktop.machine1.login",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -656,11 +672,8 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-shell" : "org.freedesktop.machine1.shell",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -861,11 +874,8 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-machines",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -949,11 +959,8 @@ int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_erro
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-machines",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -1070,11 +1077,8 @@ int bus_machine_method_open_root_directory(sd_bus_message *message, void *userda
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-machines",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->manager->polkit_registry,
                         error);
         if (r < 0)
@@ -1096,7 +1100,12 @@ int bus_machine_method_open_root_directory(sd_bus_message *message, void *userda
                 _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
                 pid_t child;
 
-                r = namespace_open(m->leader.pid, NULL, &mntns_fd, NULL, NULL, &root_fd);
+                r = namespace_open(m->leader.pid,
+                                   /* ret_pidns_fd = */ NULL,
+                                   &mntns_fd,
+                                   /* ret_netns_fd = */ NULL,
+                                   /* ret_userns_fd = */ NULL,
+                                   &root_fd);
                 if (r < 0)
                         return r;
 
@@ -1273,6 +1282,9 @@ static const sd_bus_vtable machine_vtable[] = {
         SD_BUS_PROPERTY("Class", "s", property_get_class, offsetof(Machine, class), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RootDirectory", "s", NULL, offsetof(Machine, root_directory), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("NetworkInterfaces", "ai", property_get_netif, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("VSockCID", "u", NULL, offsetof(Machine, vsock_cid), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("SSHAddress", "s", NULL, offsetof(Machine, ssh_address), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("SSHPrivateKeyPath", "s", NULL, offsetof(Machine, ssh_private_key_path), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("State", "s", property_get_state, 0, 0),
 
         SD_BUS_METHOD("Terminate",
@@ -1289,6 +1301,11 @@ static const sd_bus_vtable machine_vtable[] = {
                                 SD_BUS_NO_ARGS,
                                 SD_BUS_RESULT("a(iay)", addresses),
                                 bus_machine_method_get_addresses,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("GetSSHInfo",
+                                SD_BUS_NO_ARGS,
+                                SD_BUS_RESULT("s", ssh_address, "s", ssh_private_key_path),
+                                bus_machine_method_get_ssh_info,
                                 SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD_WITH_ARGS("GetOSRelease",
                                 SD_BUS_NO_ARGS,

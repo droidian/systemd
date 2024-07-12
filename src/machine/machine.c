@@ -27,23 +27,21 @@
 #include "path-util.h"
 #include "process-util.h"
 #include "serialize.h"
+#include "socket-util.h"
 #include "special.h"
 #include "stdio-util.h"
 #include "string-table.h"
+#include "string-util.h"
 #include "terminal-util.h"
 #include "tmpfile-util.h"
+#include "uid-range.h"
 #include "unit-name.h"
 #include "user-util.h"
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(Machine*, machine_free);
-
-int machine_new(Manager *manager, MachineClass class, const char *name, Machine **ret) {
+int machine_new(MachineClass class, const char *name, Machine **ret) {
         _cleanup_(machine_freep) Machine *m = NULL;
-        int r;
 
-        assert(manager);
         assert(class < _MACHINE_CLASS_MAX);
-        assert(name);
         assert(ret);
 
         /* Passing class == _MACHINE_CLASS_INVALID here is fine. It
@@ -56,27 +54,46 @@ int machine_new(Manager *manager, MachineClass class, const char *name, Machine 
 
         *m = (Machine) {
                 .leader = PIDREF_NULL,
+                .vsock_cid = VMADDR_CID_ANY,
         };
 
-        m->name = strdup(name);
-        if (!m->name)
-                return -ENOMEM;
-
-        if (class != MACHINE_HOST) {
-                m->state_file = path_join("/run/systemd/machines", m->name);
-                if (!m->state_file)
+        if (name) {
+                m->name = strdup(name);
+                if (!m->name)
                         return -ENOMEM;
         }
 
         m->class = class;
 
-        r = hashmap_put(manager->machines, m->name, m);
+        *ret = TAKE_PTR(m);
+        return 0;
+}
+
+int machine_link(Manager *manager, Machine *machine) {
+        int r;
+
+        assert(manager);
+        assert(machine);
+
+        if (machine->manager)
+                return -EEXIST;
+        if (!machine->name)
+                return -EINVAL;
+
+        if (machine->class != MACHINE_HOST) {
+                char *temp = path_join("/run/systemd/machines", machine->name);
+                if (!temp)
+                        return -ENOMEM;
+
+                free_and_replace(machine->state_file, temp);
+        }
+
+        r = hashmap_put(manager->machines, machine->name, machine);
         if (r < 0)
                 return r;
 
-        m->manager = manager;
+        machine->manager = manager;
 
-        *ret = TAKE_PTR(m);
         return 0;
 }
 
@@ -87,30 +104,36 @@ Machine* machine_free(Machine *m) {
         while (m->operations)
                 operation_free(m->operations);
 
-        if (m->in_gc_queue)
+        if (m->in_gc_queue) {
+                assert(m->manager);
                 LIST_REMOVE(gc_queue, m->manager->machine_gc_queue, m);
+        }
 
-        machine_release_unit(m);
+        if (m->manager) {
+                machine_release_unit(m);
 
-        free(m->scope_job);
+                (void) hashmap_remove(m->manager->machines, m->name);
 
-        (void) hashmap_remove(m->manager->machines, m->name);
-
-        if (m->manager->host_machine == m)
-                m->manager->host_machine = NULL;
+                if (m->manager->host_machine == m)
+                        m->manager->host_machine = NULL;
+        }
 
         if (pidref_is_set(&m->leader)) {
-                (void) hashmap_remove_value(m->manager->machine_leaders, PID_TO_PTR(m->leader.pid), m);
+                if (m->manager)
+                        (void) hashmap_remove_value(m->manager->machine_leaders, PID_TO_PTR(m->leader.pid), m);
                 pidref_done(&m->leader);
         }
 
         sd_bus_message_unref(m->create_message);
 
         free(m->name);
+        free(m->scope_job);
         free(m->state_file);
         free(m->service);
         free(m->root_directory);
         free(m->netif);
+        free(m->ssh_address);
+        free(m->ssh_private_key_path);
         return mfree(m);
 }
 
@@ -339,10 +362,12 @@ int machine_load(Machine *m) {
 
 static int machine_start_scope(
                 Machine *machine,
+                bool allow_pidfd,
                 sd_bus_message *more_properties,
                 sd_bus_error *error) {
 
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error e = SD_BUS_ERROR_NULL;
         _cleanup_free_ char *escaped = NULL, *unit = NULL;
         const char *description;
         int r;
@@ -384,7 +409,7 @@ static int machine_start_scope(
         if (r < 0)
                 return r;
 
-        r = bus_append_scope_pidref(m, &machine->leader);
+        r = bus_append_scope_pidref(m, &machine->leader, allow_pidfd);
         if (r < 0)
                 return r;
 
@@ -410,9 +435,16 @@ static int machine_start_scope(
         if (r < 0)
                 return r;
 
-        r = sd_bus_call(NULL, m, 0, error, &reply);
-        if (r < 0)
-                return r;
+        r = sd_bus_call(NULL, m, 0, &e, &reply);
+        if (r < 0) {
+                /* If this failed with a property we couldn't write, this is quite likely because the server
+                 * doesn't support PIDFDs yet, let's try without. */
+                if (allow_pidfd &&
+                    sd_bus_error_has_names(&e, SD_BUS_ERROR_UNKNOWN_PROPERTY, SD_BUS_ERROR_PROPERTY_READ_ONLY))
+                        return machine_start_scope(machine, /* allow_pidfd = */ false, more_properties, error);
+
+                return sd_bus_error_move(error, &e);
+        }
 
         machine->unit = TAKE_PTR(unit);
         machine->referenced = true;
@@ -432,7 +464,7 @@ static int machine_ensure_scope(Machine *m, sd_bus_message *properties, sd_bus_e
         assert(m->class != MACHINE_HOST);
 
         if (!m->unit) {
-                r = machine_start_scope(m, properties, error);
+                r = machine_start_scope(m, /* allow_pidfd = */ true, properties, error);
                 if (r < 0)
                         return log_error_errno(r, "Failed to start machine scope: %s", bus_error_message(error, r));
         }
@@ -643,8 +675,9 @@ void machine_release_unit(Machine *m) {
 
                 r = manager_unref_unit(m->manager, m->unit, &error);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to drop reference to machine scope, ignoring: %s",
-                                          bus_error_message(&error, r));
+                        log_full_errno(ERRNO_IS_DISCONNECT(r) ? LOG_DEBUG : LOG_WARNING, r,
+                                       "Failed to drop reference to machine scope, ignoring: %s",
+                                       bus_error_message(&error, r));
 
                 m->referenced = false;
         }
@@ -658,7 +691,7 @@ int machine_get_uid_shift(Machine *m, uid_t *ret) {
         uid_t uid_base, uid_shift, uid_range;
         gid_t gid_base, gid_shift, gid_range;
         _cleanup_fclose_ FILE *f = NULL;
-        int k, r;
+        int r;
 
         assert(m);
         assert(ret);
@@ -690,14 +723,9 @@ int machine_get_uid_shift(Machine *m, uid_t *ret) {
         }
 
         /* Read the first line. There's at least one. */
-        errno = 0;
-        k = fscanf(f, UID_FMT " " UID_FMT " " UID_FMT "\n", &uid_base, &uid_shift, &uid_range);
-        if (k != 3) {
-                if (ferror(f))
-                        return errno_or_else(EIO);
-
-                return -EBADMSG;
-        }
+        r = uid_map_read_one(f, &uid_base, &uid_shift, &uid_range);
+        if (r < 0)
+                return r;
 
         /* Not a mapping starting at 0? Then it's a complex mapping we can't expose here. */
         if (uid_base != 0)
@@ -722,13 +750,12 @@ int machine_get_uid_shift(Machine *m, uid_t *ret) {
 
         /* Read the first line. There's at least one. */
         errno = 0;
-        k = fscanf(f, GID_FMT " " GID_FMT " " GID_FMT "\n", &gid_base, &gid_shift, &gid_range);
-        if (k != 3) {
-                if (ferror(f))
-                        return errno_or_else(EIO);
-
+        r = fscanf(f, GID_FMT " " GID_FMT " " GID_FMT "\n", &gid_base, &gid_shift, &gid_range);
+        if (r == EOF)
+                return errno_or_else(ENOMSG);
+        assert(r >= 0);
+        if (r != 3)
                 return -EBADMSG;
-        }
 
         /* If there's more than one line, then we don't support this file. */
         r = safe_fgetc(f, NULL);
@@ -757,6 +784,7 @@ static int machine_owns_uid_internal(
 
         _cleanup_fclose_ FILE *f = NULL;
         const char *p;
+        int r;
 
         /* This is a generic implementation for both uids and gids, under the assumptions they have the same types and semantics. */
         assert_cc(sizeof(uid_t) == sizeof(gid_t));
@@ -778,18 +806,12 @@ static int machine_owns_uid_internal(
 
         for (;;) {
                 uid_t uid_base, uid_shift, uid_range, converted;
-                int k;
 
-                errno = 0;
-                k = fscanf(f, UID_FMT " " UID_FMT " " UID_FMT, &uid_base, &uid_shift, &uid_range);
-                if (k < 0 && feof(f))
+                r = uid_map_read_one(f, &uid_base, &uid_shift, &uid_range);
+                if (r == -ENOMSG)
                         break;
-                if (k != 3) {
-                        if (ferror(f))
-                                return errno_or_else(EIO);
-
-                        return -EIO;
-                }
+                if (r < 0)
+                        return r;
 
                 /* The private user namespace is disabled, ignoring. */
                 if (uid_shift == 0)
@@ -831,6 +853,7 @@ static int machine_translate_uid_internal(
 
         _cleanup_fclose_ FILE *f = NULL;
         const char *p;
+        int r;
 
         /* This is a generic implementation for both uids and gids, under the assumptions they have the same types and semantics. */
         assert_cc(sizeof(uid_t) == sizeof(gid_t));
@@ -850,18 +873,12 @@ static int machine_translate_uid_internal(
 
         for (;;) {
                 uid_t uid_base, uid_shift, uid_range, converted;
-                int k;
 
-                errno = 0;
-                k = fscanf(f, UID_FMT " " UID_FMT " " UID_FMT, &uid_base, &uid_shift, &uid_range);
-                if (k < 0 && feof(f))
+                r = uid_map_read_one(f, &uid_base, &uid_shift, &uid_range);
+                if (r == -ENOMSG)
                         break;
-                if (k != 3) {
-                        if (ferror(f))
-                                return errno_or_else(EIO);
-
-                        return -EIO;
-                }
+                if (r < 0)
+                        return r;
 
                 if (uid < uid_base || uid >= uid_base + uid_range)
                         continue;
@@ -872,6 +889,7 @@ static int machine_translate_uid_internal(
 
                 if (ret_host_uid)
                         *ret_host_uid = converted;
+
                 return 0;
         }
 

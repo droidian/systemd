@@ -118,8 +118,7 @@ libsystemd_static = static_library(
         libsystemd_sources,
         include_directories : libsystemd_includes,
         c_args : libsystemd_c_args,
-        link_with : [libbasic,
-                     libbasic_compress],
+        link_with : [libbasic],
         dependencies : [threads,
                         librt,
                         userspace],
@@ -159,6 +158,10 @@ libsystemd_tests += [
                 'sources' : files('sd-journal/test-journal-enum.c'),
                 'timeout' : 360,
         },
+        {
+                'sources' : files('sd-event/test-event.c'),
+                'timeout' : 120,
+        }
 ]
 
 ############################################################
@@ -171,7 +174,6 @@ simple_tests += files(
         'sd-device/test-device-util.c',
         'sd-device/test-sd-device-monitor.c',
         'sd-device/test-sd-device.c',
-        'sd-event/test-event.c',
         'sd-journal/test-journal-flush.c',
         'sd-journal/test-journal-interleaving.c',
         'sd-journal/test-journal-stream.c',

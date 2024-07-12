@@ -158,6 +158,10 @@
                 __atomic_exchange_n(&(o), true, __ATOMIC_SEQ_CST); \
         })
 
+#define U64_KB UINT64_C(1024)
+#define U64_MB (UINT64_C(1024) * U64_KB)
+#define U64_GB (UINT64_C(1024) * U64_MB)
+
 #undef MAX
 #define MAX(a, b) __MAX(UNIQ, (a), UNIQ, (b))
 #define __MAX(aq, a, bq, b)                             \
@@ -245,6 +249,30 @@
                         CONST_ISPOWEROF2(_x);                          \
                 }))
 
+#define ADD_SAFE(ret, a, b) (!__builtin_add_overflow(a, b, ret))
+#define INC_SAFE(a, b) __INC_SAFE(UNIQ, a, b)
+#define __INC_SAFE(q, a, b)                                     \
+        ({                                                      \
+                const typeof(a) UNIQ_T(A, q) = (a);             \
+                ADD_SAFE(UNIQ_T(A, q), *UNIQ_T(A, q), b);       \
+        })
+
+#define SUB_SAFE(ret, a, b) (!__builtin_sub_overflow(a, b, ret))
+#define DEC_SAFE(a, b) __DEC_SAFE(UNIQ, a, b)
+#define __DEC_SAFE(q, a, b)                                     \
+        ({                                                      \
+                const typeof(a) UNIQ_T(A, q) = (a);             \
+                SUB_SAFE(UNIQ_T(A, q), *UNIQ_T(A, q), b);       \
+        })
+
+#define MUL_SAFE(ret, a, b) (!__builtin_mul_overflow(a, b, ret))
+#define MUL_ASSIGN_SAFE(a, b) __MUL_ASSIGN_SAFE(UNIQ, a, b)
+#define __MUL_ASSIGN_SAFE(q, a, b)                              \
+        ({                                                      \
+                const typeof(a) UNIQ_T(A, q) = (a);             \
+                MUL_SAFE(UNIQ_T(A, q), *UNIQ_T(A, q), b);       \
+        })
+
 #define LESS_BY(a, b) __LESS_BY(UNIQ, (a), UNIQ, (b))
 #define __LESS_BY(aq, a, bq, b)                         \
         ({                                              \
@@ -294,7 +322,7 @@
                 const typeof(y) UNIQ_T(A, q) = (y);                     \
                 const typeof(x) UNIQ_T(B, q) = DIV_ROUND_UP((x), UNIQ_T(A, q)); \
                 typeof(x) UNIQ_T(C, q);                                 \
-                __builtin_mul_overflow(UNIQ_T(B, q), UNIQ_T(A, q), &UNIQ_T(C, q)) ? (typeof(x)) -1 : UNIQ_T(C, q); \
+                MUL_SAFE(&UNIQ_T(C, q), UNIQ_T(B, q), UNIQ_T(A, q)) ? UNIQ_T(C, q) : (typeof(x)) -1; \
         })
 #define ROUND_UP(x, y) __ROUND_UP(UNIQ, (x), (y))
 
@@ -489,6 +517,10 @@ static inline uint64_t ALIGN_OFFSET_U64(uint64_t l, uint64_t ali) {
                 }                                                       \
         }
 
+/* Restriction/bug (see above) was fixed in GCC 15 and clang 19.*/
+#if __GNUC__ >= 15 || (defined(__clang__) && __clang_major__ >= 19)
+#define DECLARE_FLEX_ARRAY(type, name) type name[];
+#else
 /* Declare a flexible array usable in a union.
  * This is essentially a work-around for a pointless constraint in C99
  * and might go away in some future version of the standard.
@@ -500,6 +532,7 @@ static inline uint64_t ALIGN_OFFSET_U64(uint64_t l, uint64_t ali) {
                 dummy_t __empty__ ## name;             \
                 type name[];                           \
         }
+#endif
 
 /* Declares an ELF read-only string section that does not occupy memory at runtime. */
 #define DECLARE_NOALLOC_SECTION(name, text)   \

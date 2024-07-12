@@ -98,6 +98,8 @@ REQUIREMENTS:
           CONFIG_SECCOMP_FILTER (required for seccomp support)
           CONFIG_KCMP (for the kcmp() syscall, used to be under
                        CONFIG_CHECKPOINT_RESTORE before ~5.12)
+          CONFIG_NET_SCHED
+          CONFIG_NET_SCH_FQ_CODEL
 
         Required for CPUShares= in resource control unit settings:
           CONFIG_CGROUP_SCHED
@@ -128,9 +130,10 @@ REQUIREMENTS:
 
         Required for signed Verity images support:
           CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG
-        Required to verify signed Verity images using keys enrolled in the MoK
-        (Machine-Owner Key) keyring:
+        Required to verify signed Verity images using keys enrolled in the MOK
+        (Machine-Owner Key) and DB UEFI certificate stores:
           CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG_SECONDARY_KEYRING
+          CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG_PLATFORM_KEYRING
           CONFIG_IMA_ARCH_POLICY
           CONFIG_INTEGRITY_MACHINE_KEYRING
 
@@ -166,6 +169,7 @@ REQUIREMENTS:
 
         Required for systemd-oomd:
           CONFIG_PSI
+          CONFIG_MEMCG
 
         Note that kernel auditing is broken when used with systemd's container
         code. When using systemd in conjunction with containers, please make
@@ -217,7 +221,7 @@ REQUIREMENTS:
         pyelftools (optional, required for systemd-boot)
         meson >= 0.60.0
         ninja
-        gcc >= 4.7
+        gcc >= 8.4
         awk, sed, grep, and similar tools
         clang >= 10.0, llvm >= 10.0 (optional, required to build BPF programs
                 from source code in C)
@@ -268,8 +272,8 @@ REQUIREMENTS:
         longer supported, and moving everything under /usr/ is required. Systems
         with a separate /usr/ partition must mount it before transitioning into it
         (i.e.: from the initrd). For more information see:
-        https://www.freedesktop.org/wiki/Software/systemd/separate-usr-is-broken
-        https://www.freedesktop.org/wiki/Software/systemd/TheCaseForTheUsrMerge
+        https://systemd.io/SEPARATE_USR_IS_BROKEN
+        https://systemd.io/THE_CASE_FOR_THE_USR_MERGE
 
         Additional packages are necessary to run some tests:
         - nc                 (used by test/TEST-12-ISSUE-3171)
@@ -444,5 +448,4 @@ STABLE BRANCHES AND BACKPORTS:
         Stable branches are started for certain releases of systemd and named
         after them, e.g. v238-stable. Stable branches are managed by
         distribution maintainers on an as needed basis. See
-        https://www.freedesktop.org/wiki/Software/systemd/Backports for some
-        more information and examples.
+        https://systemd.io/BACKPORTS for some more information and examples.

@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
+#include <sys/mman.h>
 
 #include "ask-password-api.h"
+#include "blockdev-util.h"
 #include "build.h"
 #include "cryptenroll-fido2.h"
 #include "cryptenroll-list.h"
@@ -13,6 +15,7 @@
 #include "cryptenroll-wipe.h"
 #include "cryptenroll.h"
 #include "cryptsetup-util.h"
+#include "devnum-util.h"
 #include "env-util.h"
 #include "escape.h"
 #include "fileio.h"
@@ -33,6 +36,7 @@ static EnrollType arg_enroll_type = _ENROLL_TYPE_INVALID;
 static char *arg_unlock_keyfile = NULL;
 static UnlockType arg_unlock_type = UNLOCK_PASSWORD;
 static char *arg_unlock_fido2_device = NULL;
+static char *arg_unlock_tpm2_device = NULL;
 static char *arg_pkcs11_token_uri = NULL;
 static char *arg_fido2_device = NULL;
 static char *arg_tpm2_device = NULL;
@@ -42,6 +46,7 @@ static Tpm2PCRValue *arg_tpm2_hash_pcr_values = NULL;
 static size_t arg_tpm2_n_hash_pcr_values = 0;
 static bool arg_tpm2_pin = false;
 static char *arg_tpm2_public_key = NULL;
+static bool arg_tpm2_load_public_key = true;
 static uint32_t arg_tpm2_public_key_pcr_mask = 0;
 static char *arg_tpm2_signature = NULL;
 static char *arg_tpm2_pcrlock = NULL;
@@ -61,6 +66,7 @@ assert_cc(sizeof(arg_wipe_slots_mask) * 8 >= _ENROLL_TYPE_MAX);
 
 STATIC_DESTRUCTOR_REGISTER(arg_unlock_keyfile, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_unlock_fido2_device, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_unlock_tpm2_device, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_pkcs11_token_uri, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_fido2_device, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_tpm2_device, freep);
@@ -98,6 +104,66 @@ static const char *const luks2_token_type_table[_ENROLL_TYPE_MAX] = {
 
 DEFINE_STRING_TABLE_LOOKUP(luks2_token_type, EnrollType);
 
+static int determine_default_node(void) {
+        int r;
+
+        /* If no device is specified we'll default to the backing device of /var/.
+         *
+         * Why /var/ and not just / you ask?
+         *
+         * On most systems /var/ is going to be on the root fs, hence the outcome is usually the same.
+         *
+         * However, on systems where / and /var/ are separate it makes more sense to default to /var/ because
+         * that's where the persistent and variable data is placed (i.e. where LUKS should be used) while /
+         * doesn't really have to be variable and could as well be immutable or ephemeral. Hence /var/ should
+         * be a better default.
+         *
+         * Or to say this differently: it makes sense to support well systems with /var/ being on /. It also
+         * makes sense to support well systems with them being separate, and /var/ being variable and
+         * persistent. But any other kind of system appears much less interesting to support, and in that
+         * case people should just specify the device name explicitly. */
+
+        dev_t devno;
+        r = get_block_device("/var", &devno);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine block device backing /var/: %m");
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(ENXIO),
+                                       "File system /var/ is on not backed by a (single) whole block device.");
+
+        _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
+        r = sd_device_new_from_devnum(&dev, 'b', devno);
+        if (r < 0)
+                return log_error_errno(r, "Unable to access backing block device for /var/: %m");
+
+        const char *dm_uuid;
+        r = sd_device_get_property_value(dev, "DM_UUID", &dm_uuid);
+        if (r == -ENOENT)
+                return log_error_errno(r, "Backing block device of /var/ is not a DM device: %m");
+        if (r < 0)
+                return log_error_errno(r, "Unable to query DM_UUID udev property of backing block device for /var/: %m");
+
+        if (!startswith(dm_uuid, "CRYPT-LUKS2-"))
+                return log_error_errno(SYNTHETIC_ERRNO(ENXIO), "Block device backing /var/ is not a LUKS2 device.");
+
+        _cleanup_(sd_device_unrefp) sd_device *origin = NULL;
+        r = block_device_get_originating(dev, &origin);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get originating device of LUKS2 device backing /var/: %m");
+
+        const char *dp;
+        r = sd_device_get_devname(origin, &dp);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get device path for LUKS2 device backing /var/: %m");
+
+        r = free_and_strdup_warn(&arg_node, dp);
+        if (r < 0)
+                return r;
+
+        log_info("No device specified, defaulting to '%s'.", arg_node);
+        return 0;
+}
+
 static int help(void) {
         _cleanup_free_ char *link = NULL;
         int r;
@@ -106,7 +172,7 @@ static int help(void) {
         if (r < 0)
                 return log_oom();
 
-        printf("%1$s [OPTIONS...] BLOCK-DEVICE\n\n"
+        printf("%1$s [OPTIONS...] [BLOCK-DEVICE]\n\n"
                "%5$sEnroll a security token or authentication credential to a LUKS volume.%6$s\n\n"
                "  -h --help            Show this help\n"
                "     --version         Show package version\n"
@@ -117,6 +183,8 @@ static int help(void) {
                "                       Use a file to unlock the volume\n"
                "     --unlock-fido2-device=PATH\n"
                "                       Use a FIDO2 device to unlock the volume\n"
+               "     --unlock-tpm2-device=PATH\n"
+               "                       Use a TPM2 device to unlock the volume\n"
                "\n%3$sSimple Enrollment:%4$s\n"
                "     --password        Enroll a user-supplied password\n"
                "     --recovery-key    Enroll a recovery key\n"
@@ -172,6 +240,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_RECOVERY_KEY,
                 ARG_UNLOCK_KEYFILE,
                 ARG_UNLOCK_FIDO2_DEVICE,
+                ARG_UNLOCK_TPM2_DEVICE,
                 ARG_PKCS11_TOKEN_URI,
                 ARG_FIDO2_DEVICE,
                 ARG_TPM2_DEVICE,
@@ -197,6 +266,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "recovery-key",                 no_argument,       NULL, ARG_RECOVERY_KEY          },
                 { "unlock-key-file",              required_argument, NULL, ARG_UNLOCK_KEYFILE        },
                 { "unlock-fido2-device",          required_argument, NULL, ARG_UNLOCK_FIDO2_DEVICE   },
+                { "unlock-tpm2-device",           required_argument, NULL, ARG_UNLOCK_TPM2_DEVICE    },
                 { "pkcs11-token-uri",             required_argument, NULL, ARG_PKCS11_TOKEN_URI      },
                 { "fido2-credential-algorithm",   required_argument, NULL, ARG_FIDO2_CRED_ALG        },
                 { "fido2-device",                 required_argument, NULL, ARG_FIDO2_DEVICE          },
@@ -301,6 +371,26 @@ static int parse_argv(int argc, char *argv[]) {
 
                         arg_unlock_type = UNLOCK_FIDO2;
                         arg_unlock_fido2_device = TAKE_PTR(device);
+                        break;
+                }
+
+                case ARG_UNLOCK_TPM2_DEVICE: {
+                        _cleanup_free_ char *device = NULL;
+
+                        if (arg_unlock_type != UNLOCK_PASSWORD)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Multiple unlock methods specified at once, refusing.");
+
+                        assert(!arg_unlock_tpm2_device);
+
+                        if (!streq(optarg, "auto")) {
+                                device = strdup(optarg);
+                                if (!device)
+                                        return log_oom();
+                        }
+
+                        arg_unlock_type = UNLOCK_TPM2;
+                        arg_unlock_tpm2_device = TAKE_PTR(device);
                         break;
                 }
 
@@ -409,9 +499,17 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_TPM2_PUBLIC_KEY:
+                        /* an empty argument disables loading a public key */
+                        if (isempty(optarg)) {
+                                arg_tpm2_load_public_key = false;
+                                arg_tpm2_public_key = mfree(arg_tpm2_public_key);
+                                break;
+                        }
+
                         r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_tpm2_public_key);
                         if (r < 0)
                                 return r;
+                        arg_tpm2_load_public_key = true;
 
                         break;
 
@@ -507,17 +605,23 @@ static int parse_argv(int argc, char *argv[]) {
                 }
         }
 
-        if (optind >= argc)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "No block device node specified, refusing.");
-
         if (argc > optind+1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Too many arguments, refusing.");
 
-        r = parse_path_argument(argv[optind], false, &arg_node);
-        if (r < 0)
-                return r;
+        if (optind < argc) {
+                r = parse_path_argument(argv[optind], false, &arg_node);
+                if (r < 0)
+                        return r;
+        } else {
+                if (wipe_requested())
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Wiping requested and no block device node specified, refusing.");
+
+                r = determine_default_node();
+                if (r < 0)
+                        return r;
+        }
 
         if (arg_enroll_type == ENROLL_FIDO2) {
 
@@ -533,31 +637,33 @@ static int parse_argv(int argc, char *argv[]) {
                 }
         }
 
-        if (auto_pcrlock) {
-                assert(!arg_tpm2_pcrlock);
+        if (arg_enroll_type == ENROLL_TPM2) {
+                if (auto_pcrlock) {
+                        assert(!arg_tpm2_pcrlock);
 
-                r = tpm2_pcrlock_search_file(NULL, NULL, &arg_tpm2_pcrlock);
-                if (r < 0) {
-                        if (r != -ENOENT)
-                                log_warning_errno(r, "Search for pcrlock.json failed, assuming it does not exist: %m");
-                } else
-                        log_info("Automatically using pcrlock policy '%s'.", arg_tpm2_pcrlock);
-        }
+                        r = tpm2_pcrlock_search_file(NULL, NULL, &arg_tpm2_pcrlock);
+                        if (r < 0) {
+                                if (r != -ENOENT)
+                                        log_warning_errno(r, "Search for pcrlock.json failed, assuming it does not exist: %m");
+                        } else
+                                log_info("Automatically using pcrlock policy '%s'.", arg_tpm2_pcrlock);
+                }
 
-        if (auto_public_key_pcr_mask) {
-                assert(arg_tpm2_public_key_pcr_mask == 0);
-                arg_tpm2_public_key_pcr_mask = INDEX_TO_MASK(uint32_t, TPM2_PCR_KERNEL_BOOT);
-        }
+                if (auto_public_key_pcr_mask) {
+                        assert(arg_tpm2_public_key_pcr_mask == 0);
+                        arg_tpm2_public_key_pcr_mask = INDEX_TO_MASK(uint32_t, TPM2_PCR_KERNEL_BOOT);
+                }
 
-        if (auto_hash_pcr_values && !arg_tpm2_pcrlock) { /* Only lock to PCR 7 by default if no pcrlock policy is around (which is a better replacement) */
-                assert(arg_tpm2_n_hash_pcr_values == 0);
+                if (auto_hash_pcr_values && !arg_tpm2_pcrlock) { /* Only lock to PCR 7 by default if no pcrlock policy is around (which is a better replacement) */
+                        assert(arg_tpm2_n_hash_pcr_values == 0);
 
-                if (!GREEDY_REALLOC_APPEND(
-                                    arg_tpm2_hash_pcr_values,
-                                    arg_tpm2_n_hash_pcr_values,
-                                    &TPM2_PCR_VALUE_MAKE(TPM2_PCR_INDEX_DEFAULT, /* hash= */ 0, /* value= */ {}),
-                                    1))
-                        return log_oom();
+                        if (!GREEDY_REALLOC_APPEND(
+                                            arg_tpm2_hash_pcr_values,
+                                            arg_tpm2_n_hash_pcr_values,
+                                            &TPM2_PCR_VALUE_MAKE(TPM2_PCR_INDEX_DEFAULT, /* hash= */ 0, /* value= */ {}),
+                                            1))
+                                return log_oom();
+                }
         }
 
         return 1;
@@ -571,7 +677,7 @@ static int check_for_homed(struct crypt_device *cd) {
         /* Politely refuse operating on homed volumes. The enrolled tokens for the user record and the LUKS2
          * volume should not get out of sync. */
 
-        for (int token = 0; token < crypt_token_max(CRYPT_LUKS2); token ++) {
+        for (int token = 0; token < crypt_token_max(CRYPT_LUKS2); token++) {
                 r = cryptsetup_get_token_as_json(cd, token, "systemd-homed", NULL);
                 if (IN_SET(r, -ENOENT, -EINVAL, -EMEDIUMTYPE))
                         continue;
@@ -644,7 +750,7 @@ static int prepare_luks(
 
         r = crypt_load(cd, CRYPT_LUKS2, NULL);
         if (r < 0)
-                return log_error_errno(r, "Failed to load LUKS2 superblock: %m");
+                return log_error_errno(r, "Failed to load LUKS2 superblock of %s: %m", arg_node);
 
         r = check_for_homed(cd);
         if (r < 0)
@@ -666,6 +772,10 @@ static int prepare_luks(
 
         switch (arg_unlock_type) {
 
+        case UNLOCK_PASSWORD:
+                r = load_volume_key_password(cd, arg_node, vk, &vks);
+                break;
+
         case UNLOCK_KEYFILE:
                 r = load_volume_key_keyfile(cd, vk, &vks);
                 break;
@@ -674,8 +784,8 @@ static int prepare_luks(
                 r = load_volume_key_fido2(cd, arg_node, arg_unlock_fido2_device, vk, &vks);
                 break;
 
-        case UNLOCK_PASSWORD:
-                r = load_volume_key_password(cd, arg_node, vk, &vks);
+        case UNLOCK_TPM2:
+                r = load_volume_key_tpm2(cd, arg_node, arg_unlock_tpm2_device, vk, &vks);
                 break;
 
         default:
@@ -696,15 +806,16 @@ static int run(int argc, char *argv[]) {
         _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         _cleanup_(erase_and_freep) void *vk = NULL;
         size_t vks;
-        int slot, r;
+        int slot, slot_to_wipe, r;
 
-        log_show_color(true);
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
+
+        /* A delicious drop of snake oil */
+        (void) mlockall(MCL_FUTURE);
 
         cryptsetup_enable_logging(NULL);
 
@@ -734,9 +845,21 @@ static int run(int argc, char *argv[]) {
                 break;
 
         case ENROLL_TPM2:
-                slot = enroll_tpm2(cd, vk, vks, arg_tpm2_device, arg_tpm2_seal_key_handle, arg_tpm2_device_key, arg_tpm2_hash_pcr_values, arg_tpm2_n_hash_pcr_values, arg_tpm2_public_key, arg_tpm2_public_key_pcr_mask, arg_tpm2_signature, arg_tpm2_pin, arg_tpm2_pcrlock);
-                break;
+                slot = enroll_tpm2(cd, vk, vks, arg_tpm2_device, arg_tpm2_seal_key_handle, arg_tpm2_device_key, arg_tpm2_hash_pcr_values, arg_tpm2_n_hash_pcr_values, arg_tpm2_public_key, arg_tpm2_load_public_key, arg_tpm2_public_key_pcr_mask, arg_tpm2_signature, arg_tpm2_pin, arg_tpm2_pcrlock, &slot_to_wipe);
 
+                if (slot >= 0 && slot_to_wipe >= 0) {
+                        /* Updating PIN on an existing enrollment */
+                        r = wipe_slots(
+                                        cd,
+                                        &slot_to_wipe,
+                                        /* n_explicit_slots= */ 1,
+                                        WIPE_EXPLICIT,
+                                        /* by_mask= */ 0,
+                                        /* except_slot= */ -1);
+                        if (r < 0)
+                                return r;
+                }
+                break;
         case _ENROLL_TYPE_INVALID:
                 /* List enrolled slots if we are called without anything to enroll or wipe */
                 if (!wipe_requested())

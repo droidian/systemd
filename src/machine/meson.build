@@ -3,6 +3,7 @@
 libmachine_core_sources = files(
         'image-dbus.c',
         'machine-dbus.c',
+        'machine-varlink.c',
         'machine.c',
         'machined-core.c',
         'machined-dbus.c',
@@ -35,9 +36,9 @@ executables += [
                 'conditions' : ['ENABLE_MACHINED'],
                 'sources' : files('machinectl.c'),
                 'dependencies' : [
-                        liblz4,
-                        libxz,
-                        libzstd,
+                        liblz4_cflags,
+                        libxz_cflags,
+                        libzstd_cflags,
                         threads,
                 ],
         },

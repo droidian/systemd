@@ -51,7 +51,7 @@
 #include "strv.h"
 #include "sync-util.h"
 #include "tmpfile-util.h"
-#include "uid-alloc-range.h"
+#include "uid-classification.h"
 #include "user-util.h"
 
 /* The maximum size up to which we process coredumps. We use 1G on 32-bit systems, and 32G on 64-bit systems */
@@ -178,8 +178,8 @@ static int parse_config(void) {
 
         int r;
 
-        r = config_parse_config_file(
-                        "coredump.conf",
+        r = config_parse_standard_file_with_dropins(
+                        "systemd/coredump.conf",
                         "Coredump\0",
                         config_item_table_lookup,
                         items,
@@ -503,17 +503,21 @@ static int save_external_coredump(
                                                   bus_error_message(&error, r));
                 }
 
+                /* First, ensure we are not going to go over the cgroup limit */
                 max_size = MIN(cgroup_limit, max_size);
-                max_size = LESS_BY(max_size, 1024U) / 2; /* Account for 1KB metadata overhead for compressing */
-                max_size = MAX(PROCESS_SIZE_MIN, max_size); /* Impose a lower minimum */
-
-                /* tmpfs might get full quickly, so check the available space too.
-                 * But don't worry about errors here, failing to access the storage
-                 * location will be better logged when writing to it. */
+                /* tmpfs might get full quickly, so check the available space too. But don't worry about
+                 * errors here, failing to access the storage location will be better logged when writing to
+                 * it. */
                 if (fstatvfs(fd, &sv) >= 0)
                         max_size = MIN((uint64_t)sv.f_frsize * (uint64_t)sv.f_bfree, max_size);
+                /* Impose a lower minimum, otherwise we will miss the basic headers. */
+                max_size = MAX(PROCESS_SIZE_MIN, max_size);
+                /* Ensure we can always switch to compressing on the fly in case we are running out of space
+                 * by keeping half of the space/memory available, plus 1KB metadata overhead from the
+                 * compression algorithm. */
+                max_size = LESS_BY(max_size, 1024U) / 2;
 
-                log_debug("Limiting core file size to %" PRIu64 " bytes due to cgroup memory limits.", max_size);
+                log_debug("Limiting core file size to %" PRIu64 " bytes due to cgroup and/or filesystem limits.", max_size);
         }
 
         r = copy_bytes(input_fd, fd, max_size, 0);
@@ -630,8 +634,7 @@ static int allocate_journal_field(int fd, size_t size, char **ret, size_t *ret_s
         if (n < 0)
                 return log_error_errno((int) n, "Failed to read core data: %m");
         if ((size_t) n < size)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO),
-                                       "Core data too short.");
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Core data too short.");
 
         *ret = TAKE_PTR(field);
         *ret_size = size + 9;
@@ -1479,7 +1482,7 @@ static int forward_coredump_to_container(Context *context) {
                         char buf[DECIMAL_STR_MAX(pid_t)];
                         const char *t = context->meta[i];
 
-                        switch(i) {
+                        switch (i) {
 
                         case META_ARGV_PID:
                                 xsprintf(buf, PID_FMT, ucred.pid);
@@ -1550,7 +1553,7 @@ static int forward_coredump_to_container(Context *context) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to wait for child to terminate: %m");
         if (r != EXIT_SUCCESS)
-                return log_debug_errno(SYNTHETIC_ERRNO(EPROTO), "Failed to process coredump in container: %m");
+                return log_debug_errno(SYNTHETIC_ERRNO(EPROTO), "Failed to process coredump in container.");
 
         return 0;
 }
@@ -1558,7 +1561,7 @@ static int forward_coredump_to_container(Context *context) {
 static int process_kernel(int argc, char* argv[]) {
         _cleanup_(iovw_free_freep) struct iovec_wrapper *iovw = NULL;
         Context context = {};
-        int r;
+        int r, signo;
 
         /* When we're invoked by the kernel, stdout/stderr are closed which is dangerous because the fds
          * could get reallocated. To avoid hard to debug issues, let's instead bind stdout/stderr to
@@ -1586,6 +1589,12 @@ static int process_kernel(int argc, char* argv[]) {
         if (!context.is_journald)
                 /* OK, now we know it's not the journal, hence we can make use of it now. */
                 log_set_target_and_open(LOG_TARGET_JOURNAL_OR_KMSG);
+
+        /* Log minimal metadata now, so it is not lost if the system is about to shut down. */
+        log_info("Process %s (%s) of user %s terminated abnormally with signal %s/%s, processing...",
+                        context.meta[META_ARGV_PID], context.meta[META_COMM],
+                        context.meta[META_ARGV_UID], context.meta[META_ARGV_SIGNAL],
+                        strna(safe_atoi(context.meta[META_ARGV_SIGNAL], &signo) >= 0 ? signal_to_string(signo) : NULL));
 
         r = in_same_namespace(getpid_cached(), context.pid, NAMESPACE_PID);
         if (r < 0)

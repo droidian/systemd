@@ -21,7 +21,7 @@
 #include "architecture.h"
 #include "argv-util.h"
 #if HAVE_LIBBPF
-#include "bpf-lsm.h"
+#include "bpf-restrict-fs.h"
 #endif
 #include "build.h"
 #include "bus-error.h"
@@ -68,6 +68,7 @@
 #include "manager-serialize.h"
 #include "mkdir-label.h"
 #include "mount-setup.h"
+#include "mount-util.h"
 #include "os-util.h"
 #include "pager.h"
 #include "parse-argument.h"
@@ -87,6 +88,7 @@
 #include "special.h"
 #include "stat-util.h"
 #include "stdio-util.h"
+#include "string-table.h"
 #include "strv.h"
 #include "switch-root.h"
 #include "sysctl-util.h"
@@ -121,7 +123,7 @@ static RuntimeScope arg_runtime_scope;
 bool arg_dump_core;
 int arg_crash_chvt;
 bool arg_crash_shell;
-bool arg_crash_reboot;
+CrashAction arg_crash_action;
 static char *arg_confirm_spawn;
 static ShowStatus arg_show_status;
 static StatusUnitFormat arg_status_unit_format;
@@ -140,6 +142,7 @@ static char **arg_default_environment;
 static char **arg_manager_environment;
 static uint64_t arg_capability_bounding_set;
 static bool arg_no_new_privs;
+static int arg_protect_system;
 static nsec_t arg_timer_slack_nsec;
 static Set* arg_syscall_archs;
 static FILE* arg_serialization;
@@ -158,6 +161,16 @@ static char **saved_env = NULL;
 
 static int parse_configuration(const struct rlimit *saved_rlimit_nofile,
                                const struct rlimit *saved_rlimit_memlock);
+
+static const char* const crash_action_table[_CRASH_ACTION_MAX] = {
+        [CRASH_FREEZE]   = "freeze",
+        [CRASH_REBOOT]   = "reboot",
+        [CRASH_POWEROFF] = "poweroff",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(crash_action, CrashAction);
+
+static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_crash_action, crash_action, CrashAction, CRASH_FREEZE, "Invalid crash action");
 
 static int manager_find_user_config_paths(char ***ret_files, char ***ret_dirs) {
         _cleanup_free_ char *base = NULL;
@@ -206,12 +219,16 @@ static int console_setup(void) {
 
         r = proc_cmdline_tty_size("/dev/console", &rows, &cols);
         if (r < 0)
-                log_warning_errno(r, "Failed to get terminal size, ignoring: %m");
+                log_warning_errno(r, "Failed to get /dev/console size, ignoring: %m");
         else {
                 r = terminal_set_size_fd(tty_fd, NULL, rows, cols);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to set terminal size, ignoring: %m");
+                        log_warning_errno(r, "Failed to set /dev/console size, ignoring: %m");
         }
+
+        r = terminal_reset_ansi_seq(tty_fd);
+        if (r < 0)
+                log_warning_errno(r, "Failed to reset /dev/console using ANSI sequences, ignoring: %m");
 
         return 0;
 }
@@ -273,7 +290,18 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                 if (r < 0)
                         log_warning_errno(r, "Failed to parse crash reboot switch %s, ignoring: %m", value);
                 else
-                        arg_crash_reboot = r;
+                        arg_crash_action = r ? CRASH_REBOOT : CRASH_FREEZE;
+
+        } else if (proc_cmdline_key_streq(key, "systemd.crash_action")) {
+
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
+
+                r = crash_action_from_string(value);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse crash action switch %s, ignoring: %m", value);
+                else
+                        arg_crash_action = r;
 
         } else if (proc_cmdline_key_streq(key, "systemd.confirm_spawn")) {
                 char *s;
@@ -462,7 +490,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                 if (proc_cmdline_value_missing(key, value))
                         return 0;
 
-                r = unbase64mem(value, SIZE_MAX, &p, &sz);
+                r = unbase64mem(value, &p, &sz);
                 if (r < 0)
                         log_warning_errno(r, "Failed to parse systemd.random_seed= argument, ignoring: %s", value);
 
@@ -610,6 +638,73 @@ static int config_parse_oom_score_adjust(
         return 0;
 }
 
+static int config_parse_protect_system_pid1(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        int *v = ASSERT_PTR(data), r;
+
+        /* This is modelled after the per-service ProtectSystem= setting, but a bit more restricted on one
+         * hand, and more automatic in another. i.e. we currently only support yes/no (not "strict" or
+         * "full"). And we will enable this automatically for the initrd unless configured otherwise.
+         *
+         * We might extend this later to match more closely what the per-service ProtectSystem= can do, but
+         * this is not trivial, due to ordering constraints: besides /usr/ we don't really have much mounted
+         * at the moment we enable this logic. */
+
+        if (isempty(rvalue) || streq(rvalue, "auto")) {
+                *v = -1;
+                return 0;
+        }
+
+        r = parse_boolean(rvalue);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse ProtectSystem= argument '%s', ignoring: %m", rvalue);
+                return 0;
+        }
+
+        *v = r;
+        return 0;
+}
+
+static int config_parse_crash_reboot(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        CrashAction *v = ASSERT_PTR(data);
+        int r;
+
+        if (isempty(rvalue)) {
+                *v = CRASH_REBOOT;
+                return 0;
+        }
+
+        r = parse_boolean(rvalue);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse CrashReboot= argument '%s', ignoring: %m", rvalue);
+                return 0;
+        }
+
+        *v = r > 0 ? CRASH_REBOOT : CRASH_FREEZE;
+        return 0;
+}
+
 static int parse_config_file(void) {
         const ConfigTableItem items[] = {
                 { "Manager", "LogLevel",                     config_parse_level2,                0,                        NULL                              },
@@ -621,7 +716,8 @@ static int parse_config_file(void) {
                 { "Manager", "CrashChVT", /* legacy */       config_parse_crash_chvt,            0,                        &arg_crash_chvt                   },
                 { "Manager", "CrashChangeVT",                config_parse_crash_chvt,            0,                        &arg_crash_chvt                   },
                 { "Manager", "CrashShell",                   config_parse_bool,                  0,                        &arg_crash_shell                  },
-                { "Manager", "CrashReboot",                  config_parse_bool,                  0,                        &arg_crash_reboot                 },
+                { "Manager", "CrashReboot",                  config_parse_crash_reboot,          0,                        &arg_crash_action                 },
+                { "Manager", "CrashAction",                  config_parse_crash_action,          0,                        &arg_crash_action                 },
                 { "Manager", "ShowStatus",                   config_parse_show_status,           0,                        &arg_show_status                  },
                 { "Manager", "StatusUnitFormat",             config_parse_status_unit_format,    0,                        &arg_status_unit_format           },
                 { "Manager", "CPUAffinity",                  config_parse_cpu_affinity2,         0,                        &arg_cpu_affinity                 },
@@ -637,6 +733,7 @@ static int parse_config_file(void) {
                 { "Manager", "RuntimeWatchdogPreGovernor",   config_parse_string,                CONFIG_PARSE_STRING_SAFE, &arg_watchdog_pretimeout_governor },
                 { "Manager", "CapabilityBoundingSet",        config_parse_capability_set,        0,                        &arg_capability_bounding_set      },
                 { "Manager", "NoNewPrivileges",              config_parse_bool,                  0,                        &arg_no_new_privs                 },
+                { "Manager", "ProtectSystem",                config_parse_protect_system_pid1,   0,                        &arg_protect_system               },
 #if HAVE_SECCOMP
                 { "Manager", "SystemCallArchitectures",      config_parse_syscall_archs,         0,                        &arg_syscall_archs                },
 #else
@@ -696,11 +793,12 @@ static int parse_config_file(void) {
         };
 
         if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM)
-                (void) config_parse_config_file("system.conf",
-                                                "Manager\0",
-                                                config_item_table_lookup, items,
-                                                CONFIG_PARSE_WARN,
-                                                NULL);
+                (void) config_parse_standard_file_with_dropins(
+                                "systemd/system.conf",
+                                "Manager\0",
+                                config_item_table_lookup, items,
+                                CONFIG_PARSE_WARN,
+                                /* userdata= */ NULL);
         else {
                 _cleanup_strv_free_ char **files = NULL, **dirs = NULL;
                 int r;
@@ -769,8 +867,8 @@ static void set_manager_settings(Manager *m) {
         m->cad_burst_action = arg_cad_burst_action;
         /* Note that we don't do structured initialization here, otherwise it will reset the rate limit
          * counter on every daemon-reload. */
-        m->reload_ratelimit.interval = arg_reload_limit_interval_sec;
-        m->reload_ratelimit.burst = arg_reload_limit_burst;
+        m->reload_reexec_ratelimit.interval = arg_reload_limit_interval_sec;
+        m->reload_reexec_ratelimit.burst = arg_reload_limit_burst;
 
         manager_set_watchdog(m, WATCHDOG_RUNTIME, arg_runtime_watchdog);
         manager_set_watchdog(m, WATCHDOG_REBOOT, arg_reboot_watchdog);
@@ -935,9 +1033,17 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_CRASH_REBOOT:
-                        r = parse_boolean_argument("--crash-reboot", optarg, &arg_crash_reboot);
+                        r = parse_boolean_argument("--crash-reboot", optarg, NULL);
                         if (r < 0)
                                 return r;
+                        arg_crash_action = r > 0 ? CRASH_REBOOT : CRASH_FREEZE;
+                        break;
+
+                case ARG_CRASH_ACTION:
+                        r = crash_action_from_string(optarg);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse crash action \"%s\": %m", optarg);
+                        arg_crash_action = r;
                         break;
 
                 case ARG_CONFIRM_SPAWN:
@@ -1053,7 +1159,7 @@ static int help(void) {
                "     --unit=UNIT                 Set default unit\n"
                "     --dump-core[=BOOL]          Dump core on crash\n"
                "     --crash-vt=NR               Change to specified VT on crash\n"
-               "     --crash-reboot[=BOOL]       Reboot on crash\n"
+               "     --crash-action=ACTION       Specify what to do on crash\n"
                "     --crash-shell[=BOOL]        Run shell on crash\n"
                "     --confirm-spawn[=BOOL]      Ask for confirmation when spawning processes\n"
                "     --show-status[=BOOL]        Show status updates on the console during boot\n"
@@ -1265,7 +1371,7 @@ static void test_usr(void) {
 
         log_warning("/usr appears to be on its own filesystem and is not already mounted. This is not a supported setup. "
                     "Some things will probably break (sometimes even silently) in mysterious ways. "
-                    "Consult https://www.freedesktop.org/wiki/Software/systemd/separate-usr-is-broken for more information.");
+                    "Consult https://systemd.io/SEPARATE_USR_IS_BROKEN for more information.");
 }
 
 static int enforce_syscall_archs(Set *archs) {
@@ -1277,7 +1383,7 @@ static int enforce_syscall_archs(Set *archs) {
 
         r = seccomp_restrict_archs(arg_syscall_archs);
         if (r < 0)
-                return log_error_errno(r, "Failed to enforce system call architecture restrication: %m");
+                return log_error_errno(r, "Failed to enforce system call architecture restriction: %m");
 #endif
         return 0;
 }
@@ -1435,7 +1541,7 @@ static int fixup_environment(void) {
                 return -errno;
 
         /* The kernels sets HOME=/ for init. Let's undo this. */
-        if (path_equal_ptr(getenv("HOME"), "/"))
+        if (path_equal(getenv("HOME"), "/"))
                 assert_se(unsetenv("HOME") == 0);
 
         return 0;
@@ -1467,31 +1573,36 @@ static int become_shutdown(int objective, int retval) {
                 [MANAGER_KEXEC]    = "kexec",
         };
 
-        char log_level[STRLEN("--log-level=") + DECIMAL_STR_MAX(int)],
-             timeout[STRLEN("--timeout=") + DECIMAL_STR_MAX(usec_t) + STRLEN("us")],
+        char timeout[STRLEN("--timeout=") + DECIMAL_STR_MAX(usec_t) + STRLEN("us")],
              exit_code[STRLEN("--exit-code=") + DECIMAL_STR_MAX(uint8_t)];
 
         _cleanup_strv_free_ char **env_block = NULL;
+        _cleanup_free_ char *max_log_levels = NULL;
         usec_t watchdog_timer = 0;
         int r;
 
         assert(objective >= 0 && objective < _MANAGER_OBJECTIVE_MAX);
         assert(table[objective]);
 
-        xsprintf(log_level, "--log-level=%d", log_get_max_level());
         xsprintf(timeout, "--timeout=%" PRI_USEC "us", arg_defaults.timeout_stop_usec);
 
-        const char* command_line[10] = {
+        const char* command_line[11] = {
                 SYSTEMD_SHUTDOWN_BINARY_PATH,
                 table[objective],
-                log_level,
                 timeout,
                 /* Note that the last position is a terminator and must contain NULL. */
         };
-        size_t pos = 4;
+        size_t pos = 3;
 
         assert(command_line[pos-1]);
         assert(!command_line[pos]);
+
+        (void) log_max_levels_to_string(log_get_max_level(), &max_log_levels);
+
+        if (max_log_levels) {
+                command_line[pos++] = "--log-level";
+                command_line[pos++] = max_log_levels;
+        }
 
         switch (log_get_target()) {
 
@@ -1538,7 +1649,7 @@ static int become_shutdown(int objective, int retval) {
         (void) watchdog_setup_pretimeout(0);
         (void) watchdog_setup_pretimeout_governor(NULL);
         r = watchdog_setup(watchdog_timer);
-        watchdog_close(r < 0);
+        watchdog_close(/* disarm= */ r < 0);
 
         /* The environment block: */
 
@@ -1666,6 +1777,35 @@ static void initialize_core_pattern(bool skip_setup) {
         if (r < 0)
                 log_warning_errno(r, "Failed to write '%s' to /proc/sys/kernel/core_pattern, ignoring: %m",
                                   arg_early_core_pattern);
+}
+
+static void apply_protect_system(bool skip_setup) {
+        int r;
+
+        if (skip_setup || getpid_cached() != 1 || arg_protect_system == 0)
+                return;
+
+        if (arg_protect_system < 0 && !in_initrd()) {
+                log_debug("ProtectSystem=auto selected, but not running in an initrd, skipping.");
+                return;
+        }
+
+        r = make_mount_point("/usr");
+        if (r < 0) {
+                log_warning_errno(r, "Failed to make /usr/ a mount point, ignoring: %m");
+                return;
+        }
+
+        if (mount_nofollow_verbose(
+                        LOG_WARNING,
+                        /* what= */ NULL,
+                        "/usr",
+                        /* fstype= */ NULL,
+                        MS_BIND|MS_REMOUNT|MS_RDONLY,
+                        /* options= */ NULL) < 0)
+                return;
+
+        log_info("Successfully made /usr/ read-only.");
 }
 
 static void update_cpu_affinity(bool skip_setup) {
@@ -1950,6 +2090,16 @@ static int invoke_main_loop(
                                                 "MESSAGE_ID=" SD_MESSAGE_CORE_MAINLOOP_FAILED_STR);
                 }
 
+                /* Ensure shutdown timestamp is taken even when bypassing the job engine */
+                if (IN_SET(objective,
+                           MANAGER_SOFT_REBOOT,
+                           MANAGER_REBOOT,
+                           MANAGER_KEXEC,
+                           MANAGER_HALT,
+                           MANAGER_POWEROFF) &&
+                    !dual_timestamp_is_set(m->timestamps + MANAGER_TIMESTAMP_SHUTDOWN_START))
+                        dual_timestamp_now(m->timestamps + MANAGER_TIMESTAMP_SHUTDOWN_START);
+
                 switch (objective) {
 
                 case MANAGER_RELOAD: {
@@ -2117,9 +2267,9 @@ static void log_execution_mode(bool *ret_first_boot) {
                         /* Let's check whether we are in first boot. First, check if an override was
                          * specified on the kernel command line. If yes, we honour that. */
 
-                        r = proc_cmdline_get_bool("systemd.condition-first-boot", /* flags = */ 0, &first_boot);
+                        r = proc_cmdline_get_bool("systemd.condition_first_boot", /* flags = */ 0, &first_boot);
                         if (r < 0)
-                                log_debug_errno(r, "Failed to parse systemd.condition-first-boot= kernel command line argument, ignoring: %m");
+                                log_debug_errno(r, "Failed to parse systemd.condition_first_boot= kernel command line argument, ignoring: %m");
 
                         if (r > 0)
                                 log_full(first_boot ? LOG_INFO : LOG_DEBUG,
@@ -2205,12 +2355,6 @@ static int initialize_runtime(
                 install_crash_handler();
 
                 if (!skip_setup) {
-                        r = mount_cgroup_controllers();
-                        if (r < 0) {
-                                *ret_error_message = "Failed to mount cgroup hierarchies";
-                                return r;
-                        }
-
                         /* Pull credentials from various sources into a common credential directory (we do
                          * this here, before setting up the machine ID, so that we can use credential info
                          * for setting up the machine ID) */
@@ -2477,7 +2621,7 @@ static void setenv_manager_environment(void) {
 
                 r = putenv_dup(*p, true);
                 if (r < 0)
-                        log_warning_errno(errno, "Failed to setenv \"%s\", ignoring: %m", *p);
+                        log_warning_errno(r, "Failed to setenv \"%s\", ignoring: %m", *p);
         }
 }
 
@@ -2491,7 +2635,7 @@ static void reset_arguments(void) {
         arg_dump_core = true;
         arg_crash_chvt = -1;
         arg_crash_shell = false;
-        arg_crash_reboot = false;
+        arg_crash_action = CRASH_FREEZE;
         arg_confirm_spawn = mfree(arg_confirm_spawn);
         arg_show_status = _SHOW_STATUS_INVALID;
         arg_status_unit_format = STATUS_UNIT_FORMAT_DEFAULT;
@@ -2515,6 +2659,7 @@ static void reset_arguments(void) {
 
         arg_capability_bounding_set = CAP_MASK_UNSET;
         arg_no_new_privs = false;
+        arg_protect_system = -1;
         arg_timer_slack_nsec = NSEC_INFINITY;
 
         arg_syscall_archs = set_free(arg_syscall_archs);
@@ -2934,6 +3079,24 @@ int main(int argc, char *argv[]) {
                         goto finish;
                 }
 
+                if (!skip_setup) {
+                        /* Before we actually start deleting cgroup v1 code, make it harder to boot
+                         * in cgroupv1 mode first. See also #30852. */
+
+                        r = mount_cgroup_legacy_controllers(loaded_policy);
+                        if (r < 0) {
+                                if (r == -ERFKILL)
+                                        error_message = "Refusing to run under cgroup v1, SYSTEMD_CGROUP_ENABLE_LEGACY_FORCE=1 not specified on kernel command line";
+                                else
+                                        error_message = "Failed to mount cgroup v1 hierarchy";
+                                goto finish;
+                        }
+                        if (r > 0) {
+                                log_full(LOG_CRIT, "Legacy cgroup v1 support selected. This is no longer supported. Will proceed anyway after 30s.");
+                                (void) usleep_safe(30 * USEC_PER_SEC);
+                        }
+                }
+
                 /* The efivarfs is now mounted, let's lock down the system token. */
                 lock_down_efi_variables();
 
@@ -3020,8 +3183,11 @@ int main(int argc, char *argv[]) {
                         cmdline_take_random_seed();
                 }
 
-                /* A core pattern might have been specified via the cmdline.  */
+                /* A core pattern might have been specified via the cmdline. */
                 initialize_core_pattern(skip_setup);
+
+                /* Make /usr/ read-only */
+                apply_protect_system(skip_setup);
 
                 /* Close logging fds, in order not to confuse collecting passed fds and terminal logic below */
                 log_close();
@@ -3178,7 +3344,8 @@ finish:
 #endif
 
         if (r < 0)
-                (void) sd_notifyf(0, "ERRNO=%i", -r);
+                (void) sd_notifyf(/* unset_environment= */ false,
+                                  "ERRNO=%i", -r);
 
         /* Try to invoke the shutdown binary unless we already failed.
          * If we failed above, we want to freeze after finishing cleanup. */
@@ -3191,7 +3358,8 @@ finish:
 
         /* This is primarily useful when running systemd in a VM, as it provides the user running the VM with
          * a mechanism to pick up systemd's exit status in the VM. */
-        (void) sd_notifyf(0, "EXIT_STATUS=%i", retval);
+        (void) sd_notifyf(/* unset_environment= */ false,
+                          "EXIT_STATUS=%i", retval);
 
         watchdog_free_device();
         arg_watchdog_device = mfree(arg_watchdog_device);

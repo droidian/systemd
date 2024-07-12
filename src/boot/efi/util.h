@@ -33,7 +33,7 @@ void *xmalloc(size_t size);
 
 _malloc_ _alloc_(1, 2) _returns_nonnull_ _warn_unused_result_
 static inline void *xmalloc_multiply(size_t n, size_t size) {
-        assert_se(!__builtin_mul_overflow(size, n, &size));
+        assert_se(MUL_ASSIGN_SAFE(&size, n));
         return xmalloc(size);
 }
 
@@ -84,7 +84,7 @@ static inline Pages xmalloc_pages(
 EFI_STATUS efivar_set(const EFI_GUID *vendor, const char16_t *name, const char16_t *value, uint32_t flags);
 EFI_STATUS efivar_set_raw(const EFI_GUID *vendor, const char16_t *name, const void *buf, size_t size, uint32_t flags);
 EFI_STATUS efivar_set_uint_string(const EFI_GUID *vendor, const char16_t *name, size_t i, uint32_t flags);
-EFI_STATUS efivar_set_uint32_le(const EFI_GUID *vendor, const char16_t *NAME, uint32_t value, uint32_t flags);
+EFI_STATUS efivar_set_uint32_le(const EFI_GUID *vendor, const char16_t *name, uint32_t value, uint32_t flags);
 EFI_STATUS efivar_set_uint64_le(const EFI_GUID *vendor, const char16_t *name, uint64_t value, uint32_t flags);
 void efivar_set_time_usec(const EFI_GUID *vendor, const char16_t *name, uint64_t usec);
 
@@ -102,7 +102,7 @@ char16_t *xstr8_to_path(const char *stra);
 char16_t *mangle_stub_cmdline(char16_t *cmdline);
 
 EFI_STATUS chunked_read(EFI_FILE *file, size_t *size, void *buf);
-EFI_STATUS file_read(EFI_FILE *dir, const char16_t *name, size_t off, size_t size, char **content, size_t *content_size);
+EFI_STATUS file_read(EFI_FILE *dir, const char16_t *name, uint64_t off, size_t size, char **content, size_t *content_size);
 
 static inline void file_closep(EFI_FILE **handle) {
         if (!*handle)

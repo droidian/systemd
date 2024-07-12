@@ -3,10 +3,13 @@
 #include "alloc-util.h"
 #include "ask-password-api.h"
 #include "cryptenroll-tpm2.h"
+#include "cryptsetup-tpm2.h"
 #include "env-util.h"
+#include "errno-util.h"
 #include "fileio.h"
 #include "hexdecoct.h"
 #include "json.h"
+#include "log.h"
 #include "memory-util.h"
 #include "random-util.h"
 #include "sha256.h"
@@ -25,7 +28,7 @@ static int search_policy_hash(
         if (hash_size == 0)
                 return 0;
 
-        for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token ++) {
+        for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
                 _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
                 _cleanup_free_ void *thash = NULL;
                 size_t thash_size = 0;
@@ -51,7 +54,7 @@ static int search_policy_hash(
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "TPM2 token data lacks 'tpm2-policy-hash' field.");
 
-                r = unhexmem(json_variant_string(w), SIZE_MAX, &thash, &thash_size);
+                r = unhexmem(json_variant_string(w), &thash, &thash_size);
                 if (r < 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Invalid base64 data in 'tpm2-policy-hash' field.");
@@ -84,28 +87,29 @@ static int get_pin(char **ret_pin_str, TPM2Flags *ret_flags) {
                                 return log_error_errno(
                                                 SYNTHETIC_ERRNO(ENOKEY), "Too many attempts, giving up.");
 
+                        AskPasswordRequest req = {
+                                .message = "Please enter TPM2 PIN:",
+                                .icon = "drive-harddisk",
+                                .keyring = "tpm2-pin",
+                                .credential = "cryptenroll.new-tpm2-pin",
+                        };
+
                         pin = strv_free_erase(pin);
                         r = ask_password_auto(
-                                        "Please enter TPM2 PIN:",
-                                        "drive-harddisk",
-                                        NULL,
-                                        "tpm2-pin",
-                                        "cryptenroll.tpm2-pin",
-                                        USEC_INFINITY,
-                                        0,
+                                        &req,
+                                        /* until= */ USEC_INFINITY,
+                                        /* flags= */ 0,
                                         &pin);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to ask for user pin: %m");
                         assert(strv_length(pin) == 1);
 
+                        req.message = "Please enter TPM2 PIN (repeat):";
+
                         r = ask_password_auto(
-                                        "Please enter TPM2 PIN (repeat):",
-                                        "drive-harddisk",
-                                        NULL,
-                                        "tpm2-pin",
-                                        "cryptenroll.tpm2-pin",
+                                        &req,
                                         USEC_INFINITY,
-                                        0,
+                                        /* flags= */ 0,
                                         &pin2);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to ask for user pin: %m");
@@ -129,6 +133,114 @@ static int get_pin(char **ret_pin_str, TPM2Flags *ret_flags) {
         return 0;
 }
 
+int load_volume_key_tpm2(
+                struct crypt_device *cd,
+                const char *cd_node,
+                const char *device,
+                void *ret_vk,
+                size_t *ret_vks) {
+
+        _cleanup_(iovec_done_erase) struct iovec decrypted_key = {};
+        _cleanup_(erase_and_freep) char *passphrase = NULL;
+        ssize_t passphrase_size;
+        int r;
+
+        assert_se(cd);
+        assert_se(cd_node);
+        assert_se(ret_vk);
+        assert_se(ret_vks);
+
+        bool found_some = false;
+        int token = 0; /* first token to look at */
+
+        for (;;) {
+                _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {};
+                _cleanup_(iovec_done) struct iovec blob = {}, policy_hash = {};
+                uint32_t hash_pcr_mask, pubkey_pcr_mask;
+                uint16_t pcr_bank, primary_alg;
+                TPM2Flags tpm2_flags;
+                int keyslot;
+
+                r = find_tpm2_auto_data(
+                                cd,
+                                UINT32_MAX,
+                                token,
+                                &hash_pcr_mask,
+                                &pcr_bank,
+                                &pubkey,
+                                &pubkey_pcr_mask,
+                                &primary_alg,
+                                &blob,
+                                &policy_hash,
+                                &salt,
+                                &srk,
+                                &pcrlock_nv,
+                                &tpm2_flags,
+                                &keyslot,
+                                &token);
+                if (r == -ENXIO)
+                        return log_full_errno(LOG_NOTICE,
+                                              SYNTHETIC_ERRNO(EAGAIN),
+                                              found_some
+                                              ? "No TPM2 metadata matching the current system state found in LUKS2 header."
+                                              : "No TPM2 metadata enrolled in LUKS2 header.");
+                if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                        /* TPM2 support not compiled in? */
+                        return log_debug_errno(SYNTHETIC_ERRNO(EAGAIN), "TPM2 support not available.");
+                if (r < 0)
+                        return r;
+
+                found_some = true;
+
+                r = acquire_tpm2_key(
+                                cd_node,
+                                device,
+                                hash_pcr_mask,
+                                pcr_bank,
+                                &pubkey,
+                                pubkey_pcr_mask,
+                                /* signature_path= */ NULL,
+                                /* pcrlock_path= */ NULL,
+                                primary_alg,
+                                /* key_file= */ NULL, /* key_file_size= */ 0, /* key_file_offset= */ 0, /* no key file */
+                                &blob,
+                                &policy_hash,
+                                &salt,
+                                &srk,
+                                &pcrlock_nv,
+                                tpm2_flags,
+                                /* until= */ 0,
+                                "cryptenroll.tpm2-pin",
+                                /* askpw_flags= */ 0,
+                                &decrypted_key);
+                if (IN_SET(r, -EACCES, -ENOLCK))
+                        return log_notice_errno(SYNTHETIC_ERRNO(EAGAIN), "TPM2 PIN unlock failed");
+                if (r != -EPERM)
+                        break;
+
+                token++; /* try a different token next time */
+        }
+
+        if (r < 0)
+                return log_error_errno(r, "Unlocking via TPM2 device failed: %m");
+
+        passphrase_size = base64mem(decrypted_key.iov_base, decrypted_key.iov_len, &passphrase);
+        if (passphrase_size < 0)
+                return log_oom();
+
+        r = crypt_volume_key_get(
+                        cd,
+                        CRYPT_ANY_SLOT,
+                        ret_vk,
+                        ret_vks,
+                        passphrase,
+                        passphrase_size);
+        if (r < 0)
+                return log_error_errno(r, "Unlocking via TPM2 device failed: %m");
+
+        return r;
+}
+
 int enroll_tpm2(struct crypt_device *cd,
                 const void *volume_key,
                 size_t volume_key_size,
@@ -137,22 +249,22 @@ int enroll_tpm2(struct crypt_device *cd,
                 const char *device_key,
                 Tpm2PCRValue *hash_pcr_values,
                 size_t n_hash_pcr_values,
-                const char *pubkey_path,
+                const char *pcr_pubkey_path,
+                bool load_pcr_pubkey,
                 uint32_t pubkey_pcr_mask,
                 const char *signature_path,
                 bool use_pin,
-                const char *pcrlock_path) {
+                const char *pcrlock_path,
+                int *ret_slot_to_wipe) {
 
-        _cleanup_(erase_and_freep) void *secret = NULL;
         _cleanup_(json_variant_unrefp) JsonVariant *v = NULL, *signature_json = NULL;
         _cleanup_(erase_and_freep) char *base64_encoded = NULL;
-        _cleanup_free_ void *srk_buf = NULL;
-        size_t secret_size, blob_size, pubkey_size = 0, srk_buf_size = 0;
-        _cleanup_free_ void *blob = NULL, *pubkey = NULL;
+        _cleanup_(iovec_done) struct iovec srk = {}, blob = {}, pubkey = {};
+        _cleanup_(iovec_done_erase) struct iovec secret = {};
         const char *node;
         _cleanup_(erase_and_freep) char *pin_str = NULL;
         ssize_t base64_encoded_size;
-        int r, keyslot;
+        int r, keyslot, slot_to_wipe = -1;
         TPM2Flags flags = 0;
         uint8_t binary_salt[SHA256_DIGEST_SIZE] = {};
         /*
@@ -168,6 +280,7 @@ int enroll_tpm2(struct crypt_device *cd,
         assert(volume_key_size > 0);
         assert(tpm2_pcr_values_valid(hash_pcr_values, n_hash_pcr_values));
         assert(TPM2_PCR_MASK_VALID(pubkey_pcr_mask));
+        assert(ret_slot_to_wipe);
 
         assert_se(node = crypt_get_device_name(cd));
 
@@ -194,27 +307,33 @@ int enroll_tpm2(struct crypt_device *cd,
         }
 
         TPM2B_PUBLIC public = {};
-        r = tpm2_load_pcr_public_key(pubkey_path, &pubkey, &pubkey_size);
-        if (r < 0) {
-                if (pubkey_path || signature_path || r != -ENOENT)
-                        return log_error_errno(r, "Failed to read TPM PCR public key: %m");
+        /* Load the PCR public key if specified explicitly, or if no pcrlock policy was specified and
+         * automatic loading of PCR public keys wasn't disabled explicitly. The reason we turn this off when
+         * pcrlock is configured is simply that we currently not support both in combination. */
+        if (pcr_pubkey_path || (load_pcr_pubkey && !pcrlock_path)) {
+                r = tpm2_load_pcr_public_key(pcr_pubkey_path, &pubkey.iov_base, &pubkey.iov_len);
+                if (r < 0) {
+                        if (pcr_pubkey_path || signature_path || r != -ENOENT)
+                                return log_error_errno(r, "Failed to read TPM PCR public key: %m");
 
-                log_debug_errno(r, "Failed to read TPM2 PCR public key, proceeding without: %m");
-                pubkey_pcr_mask = 0;
-        } else {
-                r = tpm2_tpm2b_public_from_pem(pubkey, pubkey_size, &public);
-                if (r < 0)
-                        return log_error_errno(r, "Could not convert public key to TPM2B_PUBLIC: %m");
-
-                if (signature_path) {
-                        /* Also try to load the signature JSON object, to verify that our enrollment will work.
-                         * This is optional however, skip it if it's not explicitly provided. */
-
-                        r = tpm2_load_pcr_signature(signature_path, &signature_json);
+                        log_debug_errno(r, "Failed to read TPM2 PCR public key, proceeding without: %m");
+                        pubkey_pcr_mask = 0;
+                } else {
+                        r = tpm2_tpm2b_public_from_pem(pubkey.iov_base, pubkey.iov_len, &public);
                         if (r < 0)
-                                return log_debug_errno(r, "Failed to read TPM PCR signature: %m");
+                                return log_error_errno(r, "Could not convert public key to TPM2B_PUBLIC: %m");
+
+                        if (signature_path) {
+                                /* Also try to load the signature JSON object, to verify that our enrollment will work.
+                                 * This is optional however, skip it if it's not explicitly provided. */
+
+                                r = tpm2_load_pcr_signature(signature_path, &signature_json);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to read TPM PCR signature: %m");
+                        }
                 }
-        }
+        } else
+                pubkey_pcr_mask = 0;
 
         bool any_pcr_value_specified = tpm2_pcr_values_has_any_values(hash_pcr_values, n_hash_pcr_values);
 
@@ -223,6 +342,8 @@ int enroll_tpm2(struct crypt_device *cd,
                 r = tpm2_pcrlock_policy_load(pcrlock_path, &pcrlock_policy);
                 if (r < 0)
                         return r;
+                if (r == 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOENT), "Couldn't find pcrlock policy %s.", pcrlock_path);
 
                 any_pcr_value_specified = true;
                 flags |= TPM2_FLAGS_USE_PCRLOCK;
@@ -252,8 +373,10 @@ int enroll_tpm2(struct crypt_device *cd,
 
         uint16_t hash_pcr_bank = 0;
         uint32_t hash_pcr_mask = 0;
+
         if (n_hash_pcr_values > 0) {
                 size_t hash_count;
+
                 r = tpm2_pcr_values_hash_count(hash_pcr_values, n_hash_pcr_values, &hash_count);
                 if (r < 0)
                         return log_error_errno(r, "Could not get hash count: %m");
@@ -261,17 +384,28 @@ int enroll_tpm2(struct crypt_device *cd,
                 if (hash_count > 1)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Multiple PCR banks selected.");
 
+                /* If we use a literal PCR value policy, derive the bank to use from the algorithm specified on the hash values */
                 hash_pcr_bank = hash_pcr_values[0].hash;
                 r = tpm2_pcr_values_to_mask(hash_pcr_values, n_hash_pcr_values, hash_pcr_bank, &hash_pcr_mask);
                 if (r < 0)
                         return log_error_errno(r, "Could not get hash mask: %m");
+        } else if (pubkey_pcr_mask != 0) {
+
+                /* If no literal PCR value policy is used, then let's determine the mask to use automatically
+                 * from the measurements of the TPM. */
+                r = tpm2_get_best_pcr_bank(
+                                tpm2_context,
+                                pubkey_pcr_mask,
+                                &hash_pcr_bank);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to determine best PCR bank: %m");
         }
 
         TPM2B_DIGEST policy = TPM2B_DIGEST_MAKE(NULL, TPM2_SHA256_DIGEST_SIZE);
         r = tpm2_calculate_sealing_policy(
                         hash_pcr_values,
                         n_hash_pcr_values,
-                        pubkey ? &public : NULL,
+                        iovec_is_set(&pubkey) ? &public : NULL,
                         use_pin,
                         pcrlock_path ? &pcrlock_policy : NULL,
                         &policy);
@@ -283,21 +417,21 @@ int enroll_tpm2(struct crypt_device *cd,
                                 seal_key_handle,
                                 &device_key_public,
                                 /* attributes= */ NULL,
-                                /* secret= */ NULL, /* secret_size= */ 0,
+                                /* secret= */ NULL,
                                 &policy,
                                 pin_str,
-                                &secret, &secret_size,
-                                &blob, &blob_size,
-                                &srk_buf, &srk_buf_size);
+                                &secret,
+                                &blob,
+                                &srk);
         else
                 r = tpm2_seal(tpm2_context,
                               seal_key_handle,
                               &policy,
                               pin_str,
-                              &secret, &secret_size,
-                              &blob, &blob_size,
+                              &secret,
+                              &blob,
                               /* ret_primary_alg= */ NULL,
-                              &srk_buf, &srk_buf_size);
+                              &srk);
         if (r < 0)
                 return log_error_errno(r, "Failed to seal to TPM2: %m");
 
@@ -307,39 +441,42 @@ int enroll_tpm2(struct crypt_device *cd,
                 log_debug_errno(r, "PCR policy hash not yet enrolled, enrolling now.");
         else if (r < 0)
                 return r;
-        else {
+        else if (use_pin) {
+                log_debug("This PCR set is already enrolled, re-enrolling anyway to update PIN.");
+                slot_to_wipe = r;
+        } else {
                 log_info("This PCR set is already enrolled, executing no operation.");
+                *ret_slot_to_wipe = slot_to_wipe;
                 return r; /* return existing keyslot, so that wiping won't kill it */
         }
 
         /* If possible, verify the sealed data object. */
-        if ((!pubkey || signature_json) && !any_pcr_value_specified && !device_key) {
-                _cleanup_(erase_and_freep) void *secret2 = NULL;
-                size_t secret2_size;
+        if ((!iovec_is_set(&pubkey) || signature_json) && !any_pcr_value_specified && !device_key) {
+                _cleanup_(iovec_done_erase) struct iovec secret2 = {};
 
                 log_debug("Unsealing for verification...");
                 r = tpm2_unseal(tpm2_context,
                                 hash_pcr_mask,
                                 hash_pcr_bank,
-                                pubkey, pubkey_size,
+                                &pubkey,
                                 pubkey_pcr_mask,
                                 signature_json,
                                 pin_str,
                                 pcrlock_path ? &pcrlock_policy : NULL,
                                 /* primary_alg= */ 0,
-                                blob, blob_size,
-                                policy.buffer, policy.size,
-                                srk_buf, srk_buf_size,
-                                &secret2, &secret2_size);
+                                &blob,
+                                &IOVEC_MAKE(policy.buffer, policy.size),
+                                &srk,
+                                &secret2);
                 if (r < 0)
                         return log_error_errno(r, "Failed to unseal secret using TPM2: %m");
 
-                if (memcmp_nn(secret, secret_size, secret2, secret2_size) != 0)
+                if (iovec_memcmp(&secret, &secret2) != 0)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "TPM2 seal/unseal verification failed.");
         }
 
         /* let's base64 encode the key to use, for compat with homed (and it's easier to every type it in by keyboard, if that might end up being necessary. */
-        base64_encoded_size = base64mem(secret, secret_size, &base64_encoded);
+        base64_encoded_size = base64mem(secret.iov_base, secret.iov_len, &base64_encoded);
         if (base64_encoded_size < 0)
                 return log_error_errno(base64_encoded_size, "Failed to base64 encode secret key: %m");
 
@@ -361,14 +498,14 @@ int enroll_tpm2(struct crypt_device *cd,
                         keyslot,
                         hash_pcr_mask,
                         hash_pcr_bank,
-                        pubkey, pubkey_size,
+                        &pubkey,
                         pubkey_pcr_mask,
                         /* primary_alg= */ 0,
-                        blob, blob_size,
-                        policy.buffer, policy.size,
-                        use_pin ? binary_salt : NULL,
-                        use_pin ? sizeof(binary_salt) : 0,
-                        srk_buf, srk_buf_size,
+                        &blob,
+                        &IOVEC_MAKE(policy.buffer, policy.size),
+                        use_pin ? &IOVEC_MAKE(binary_salt, sizeof(binary_salt)) : NULL,
+                        &srk,
+                        pcrlock_path ? &pcrlock_policy.nv_handle : NULL,
                         flags,
                         &v);
         if (r < 0)
@@ -379,5 +516,7 @@ int enroll_tpm2(struct crypt_device *cd,
                 return log_error_errno(r, "Failed to add TPM2 JSON token to LUKS2 header: %m");
 
         log_info("New TPM2 token enrolled as key slot %i.", keyslot);
+
+        *ret_slot_to_wipe = slot_to_wipe;
         return keyslot;
 }
