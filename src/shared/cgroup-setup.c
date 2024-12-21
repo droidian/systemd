@@ -169,9 +169,12 @@ bool cg_is_legacy_force_enabled(void) {
         if (!cg_is_legacy_enabled())
                 return false;
 
+/* Droidian: do not require a special cmdline for cgroup v1 */
+#ifndef WITH_DROIDIAN_EXTENSIONS
         r = proc_cmdline_get_bool("SYSTEMD_CGROUP_ENABLE_LEGACY_FORCE", /* flags = */ 0, &b);
         if (r <= 0 || !b)
                 return false;
+#endif /* WITH_DROIDIAN_EXTENSIONS */
 
         return true;
 }

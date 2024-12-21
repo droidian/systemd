@@ -225,6 +225,9 @@ ifneq (,$(filter $(DEB_TARGET_ARCH), arm64 armhf riscv64))
 CONFFLAGS += -Defi-stub-extra-sections=500
 endif
 
+# Droidian extensions
+CONFFLAGS_DISTRO += -Dc_args='-DWITH_DROIDIAN_EXTENSIONS'
+
 override_dh_auto_configure:
 	dh_auto_configure \
 		-- $(CONFFLAGS) $(CONFFLAGS_DISTRO) $(CONFFLAGS_UPSTREAM)
