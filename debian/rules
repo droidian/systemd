@@ -14,6 +14,12 @@ else ifeq (arm64,$(DEB_HOST_ARCH))
 export TEMPLATE_EFI_ARCH=aa64
 endif
 
+# We are building on OBS? Then it's an upstream build, set the profile and
+# use the addon for Secure Boot EFI signing
+ifneq ("$(wildcard /.build/build.dist)","")
+export DEB_BUILD_PROFILES += pkg.systemd.upstream
+DH_ADDONS = --with=signobs
+endif
 
 ifeq ($(DEB_VENDOR),Ubuntu)
     DEFAULT_NTP_SERVERS = ntp.ubuntu.com
@@ -52,7 +58,6 @@ export DEB_BUILD_MAINT_OPTIONS = optimize=+lto hardening=+pie $(DEB_BUILD_OPTION
 
 CONFFLAGS = \
 	-Dstatic-libsystemd=true \
-	-Dmode=release \
 	-Dversion-tag="$(VERSION_TAG)" \
 	-Dquotaon-path=/usr/sbin/quotaon \
 	-Dquotacheck-path=/usr/sbin/quotacheck \
@@ -83,8 +88,6 @@ CONFFLAGS = \
 	-Doomd=true \
 	-Durlify=true \
 	-Dgnutls=disabled \
-	-Dlink-udev-shared=false \
-	-Dlink-systemctl-shared=false \
 	-Dntp-servers="$(DEFAULT_NTP_SERVERS)" \
 	-Dsystem-uid-max=999 \
 	-Dsystem-gid-max=999 \
@@ -92,11 +95,9 @@ CONFFLAGS = \
 	-Dnobody-group=nogroup \
 	-Ddev-kvm-mode=0660 \
 	-Dgroup-render-mode=0660 \
-	-Dsbat-distro-url=https://tracker.debian.org/pkg/systemd \
 	-Drepart=enabled \
 	-Dfdisk=enabled \
 	-Dsysext=true \
-	-Dnscd=true \
 	-Dselinux=enabled \
 	-Dhwdb=true \
 	-Dsysusers=true \
@@ -112,6 +113,7 @@ CONFFLAGS = \
 	-Dstatus-unit-format-default=combined \
 	-Dstandalone-binaries=true \
 	-Dutmp=false \
+	-Dtty-mode=0600 \
 	-Dmode=$(if $(filter pkg.systemd.upstream,$(DEB_BUILD_PROFILES)),developer,release)
 
 ifeq ($(filter nocheck,$(DEB_BUILD_PROFILES))$(filter noinsttest,$(DEB_BUILD_PROFILES)),nochecknoinsttest)
@@ -145,7 +147,7 @@ CONFFLAGS += \
 	-Duserdb=true \
 	-Dpcre2=enabled \
 	-Dukify=enabled \
-	-Dbootloader=$(if $(filter amd64 i386 arm64 armhf riscv64,$(DEB_HOST_ARCH)),enabled,disabled) \
+	-Dbootloader=$(if $(filter amd64 i386 arm64 armhf loong64 riscv64,$(DEB_HOST_ARCH)),enabled,disabled) \
 	-Dsysupdate=enabled
 else
 CONFFLAGS += \
@@ -178,10 +180,16 @@ endif
 ifeq (, $(filter $(DEB_BUILD_PROFILES), stage1 pkg.systemd.nobpf))
 ifneq (,$(filter $(DEB_TARGET_ARCH), amd64 arm64 ppc64el riscv64 s390x))
 CONFFLAGS += \
+	-Dvmlinux-h=provided \
 	-Dbpf-framework=enabled \
 	-Dbpf-compiler=clang
 
-ifeq ($(DEB_VENDOR),Ubuntu)
+ifneq ($(DEB_VENDOR),Ubuntu)
+CONFFLAGS += -Dvmlinux-h-path=/usr/include/$(DEB_HOST_MULTIARCH)/linux/bpf/vmlinux.h
+else
+CONFFLAGS += -Dvmlinux-h-path=/usr/include/$(DEB_HOST_MULTIARCH)/linux/vmlinux.h
+# TODO: drop this and the alternative build dep once support for Noble is dropped
+#
 # Source: https://git.launchpad.net/ubuntu/+source/xdp-tools/tree/debian/rules
 # On Ubuntu, the `bpftool` in path is a shell wrapper pointing at
 # the binary corresponding to runtime kernel version.
@@ -194,21 +202,12 @@ ifeq ($(DEB_VENDOR),Ubuntu)
 # If any /usr/lib/linux-tools/*/bpftool exists, locate the most recent
 # version and point to that, otherwise `bpftool` from PATH will be
 # used.
-bpftool_binary := $(shell find /usr/lib/linux-tools/ -name 'bpftool' -perm /u=x 2>/dev/null | sort | head -n1)
+#
+# Newer versions of linux-tools-* ship the binaries in /usr/lib/linux-tools-$(uname -r).
+# Check there too.
+bpftool_binary := $(shell find /usr/lib/linux-tools/ /usr/lib/linux-tools-* -name 'bpftool' -perm /u=x 2>/dev/null | sort -r | head -n1)
 ifneq ($(bpftool_binary),)
 export PATH := $(shell dirname $(bpftool_binary)):$(PATH)
-endif
-endif
-
-# TODO: once linux-bpf-dev is available in all releases that we build for, drop the
-# conditional on the wildcard and the alternative dependency on linux-headers-generic
-ifneq ("$(wildcard /usr/include/$(DEB_HOST_MULTIARCH)/linux/bpf/vmlinux.h)","")
-CONFFLAGS += -Dvmlinux-h=provided -Dvmlinux-h-path=/usr/include/$(DEB_HOST_MULTIARCH)/linux/bpf/vmlinux.h
-else
-ifneq (, $(filter pkg.systemd.upstream, $(DEB_BUILD_PROFILES)))
-CONFFLAGS += -Dvmlinux-h=auto
-else
-CONFFLAGS += -Dvmlinux-h=disabled
 endif
 endif
 endif
@@ -216,6 +215,11 @@ endif
 
 ifeq (, $(filter pkg.systemd.upstream, $(DEB_BUILD_PROFILES)))
 CONFFLAGS += -Ddns-servers=''
+CONFFLAGS += -Dsbat-distro-url=https://tracker.debian.org/pkg/systemd
+else
+CONFFLAGS += -Dsbat-distro-url=https://github.com/systemd/systemd
+CONFFLAGS += -Dsbat-distro=upstream
+CONFFLAGS += -Dsbat-distro-summary='Upstream build from git'
 endif
 
 # Increase the minimum number of sections to keep free in stub PE header in
@@ -237,6 +241,7 @@ execute_before_dh_auto_build:
 	@echo 'blhc: ignore-line-regexp: .* -o test-bus-vtable-cc.*'
 	@echo 'blhc: ignore-line-regexp: .*cc -E.*'
 	@echo 'blhc: ignore-line-regexp: .* -o src/boot/.*'
+	@echo 'blhc: ignore-line-regexp: .* Compiling C object fuzz.*'
 
 execute_before_dh_auto_clean:
 ifneq (, $(filter pkg.systemd.upstream, $(DEB_BUILD_PROFILES)))
@@ -263,7 +268,7 @@ ifeq ($(DEB_VENDOR),Ubuntu)
 	cp -a debian/extra/units-ubuntu/* debian/systemd/usr/lib/systemd/system/
 endif
 
-ifeq (,$(filter stage1 pkg.systemd.upstream, $(DEB_BUILD_PROFILES)))
+ifeq (,$(filter stage1, $(DEB_BUILD_PROFILES)))
 ifeq ($(DEB_VENDOR),Debian)
 ifneq ($(TEMPLATE_EFI_ARCH),)
 	debian/extra/gen-signing-template $(DEB_VERSION) $(DEB_HOST_ARCH) $(TEMPLATE_EFI_ARCH)
@@ -303,9 +308,11 @@ override_dh_shlibdeps:
 
 override_dh_makeshlibs:
 	sed 's/SHARED_LIB_VERSION/$(PROJECT_VERSION)/' debian/shlibs.local.in > debian/shlibs.local
-	dh_makeshlibs -plibudev1 --add-udeb=libudev1-udeb -- -c$(GENSYMBOLS_LEVEL)
 	dh_makeshlibs -plibsystemd-shared -Xlibsystemd-shared -Xlibsystemd-core -- -c$(GENSYMBOLS_LEVEL)
 	dh_makeshlibs --remaining-packages -- -c$(GENSYMBOLS_LEVEL)
+	# Ensure builds against the udeb package gets a dependency on libudev1-udeb. The last time a symbol
+	# was added was in 247, and the API is pretty much frozen, so we can have a fixed version here.
+	echo 'udeb: libudev 1 libudev1-udeb (>= 247)' >> debian/libudev1/DEBIAN/shlibs
 
 override_dh_auto_test:
 
@@ -318,7 +325,7 @@ endif
 endif
 
 %:
-	dh $@
+	dh $@ $(DH_ADDONS)
 
 # TODO: ideally it should be possible to disable this via an env var or DEB_BUILD_OPTIONS
 override_dh_strip_nondeterminism:

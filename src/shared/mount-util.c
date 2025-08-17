@@ -1784,11 +1784,11 @@ int make_fsmount(
         if (mnt_fd < 0)
                 return log_full_errno(error_log_level, errno, "Failed to create mount fd for \"%s\" (\"%s\"): %m", what, type);
 
-        if (mount_setattr(mnt_fd, "", AT_EMPTY_PATH|AT_RECURSIVE,
-                          &(struct mount_attr) {
-                                  .attr_set = ms_flags_to_mount_attr(f) | (userns_fd >= 0 ? MOUNT_ATTR_IDMAP : 0),
-                                  .userns_fd = userns_fd,
-                          }, MOUNT_ATTR_SIZE_VER0) < 0)
+        struct mount_attr ma = {
+                .attr_set = ms_flags_to_mount_attr(f) | (userns_fd >= 0 ? MOUNT_ATTR_IDMAP : 0),
+                .userns_fd = userns_fd,
+        };
+        if (ma.attr_set != 0 && mount_setattr(mnt_fd, "", AT_EMPTY_PATH|AT_RECURSIVE, &ma, MOUNT_ATTR_SIZE_VER0) < 0)
                 return log_full_errno(error_log_level,
                                       errno,
                                       "Failed to set mount flags for \"%s\" (\"%s\"): %m",
@@ -1824,7 +1824,9 @@ static int path_get_mount_info_at(
         if (r < 0)
                 return log_debug_errno(r, "Failed to get mount ID: %m");
 
-        r = libmount_parse("/proc/self/mountinfo", NULL, &table, &iter);
+        /* When getting options is requested, do not pass filename, otherwise utab will not read, and
+         * userspace options like "_netdev" will be lost. */
+        r = libmount_parse(ret_options ? NULL : "/proc/self/mountinfo", /* source = */ NULL, &table, &iter);
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse /proc/self/mountinfo: %m");
 

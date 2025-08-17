@@ -38,12 +38,11 @@
 # where /dev/input/eventXX is the device in question. If in doubt, simply use
 # /dev/input/event* to reload all input rules.
 #
-# If your changes are generally applicable, preferably send them as a pull
-# request to
+# If your changes are generally applicable, send them as a pull request to
 #   https://github.com/systemd/systemd
 # or create a bug report on https://github.com/systemd/systemd/issues and
 # include your new rules, a description of the device, and the output of
-#   udevadm info /dev/input/eventXX.
+#   udevadm info /dev/input/eventXX
 #
 # Allowed properties are:
 #    EVDEV_ABS_<axis>=<min>:<max>:<res>:<fuzz>:<flat>
@@ -215,6 +214,13 @@ evdev:name:Elan Touchpad:dmi:*:svnASUSTeKCOMPUTERINC.:pnUX305UA:*
 
 # Asus UX362FA
 evdev:name:ELAN1401:00 04F3:30DC Touchpad:dmi:*:svnASUSTeKCOMPUTERINC.:pnZenBookUX362FA_UX362FA:*
+ EVDEV_ABS_00=:::8
+ EVDEV_ABS_01=:::8
+ EVDEV_ABS_35=:::8
+ EVDEV_ABS_36=:::8
+
+# ASUS X1504ZA
+evdev:name:ASUP1301:00 093A:2009 Touchpad:dmi:*:svnASUSTeKCOMPUTERINC.*:pvr1.0*:
  EVDEV_ABS_00=:::8
  EVDEV_ABS_01=:::8
  EVDEV_ABS_35=:::8
@@ -772,6 +778,13 @@ evdev:name:ETPS/2 Elantech Touchpad:dmi:*svnLENOVO:*pvrLenovoG580**
  EVDEV_ABS_35=-170:2950:24
  EVDEV_ABS_36=-591:700:25
 
+# Lenovo Yoga Slim 7 14ARE05
+evdev:name:ELAN0634:00 04F3:3124 Touchpad:dmi:*svnLENOVO:*pvrYogaSlim714ARE05**
+ EVDEV_ABS_00=::31
+ EVDEV_ABS_01=::30
+ EVDEV_ABS_35=::31
+ EVDEV_ABS_36=::30
+
 #########################################
 # Microsoft
 #########################################
@@ -941,6 +954,12 @@ evdev:input:b0003v2179p0004*
 evdev:input:b0003v172Fp0031*
  EVDEV_ABS_00=0:10000:400
  EVDEV_ABS_01=0:6250:400
+
+# WALTOP International Corp. Slim Tablet Stylus
+evdev:input:b0003v172Fp0034*
+ EVDEV_ABS_00=0:20000:80
+ EVDEV_ABS_01=0:12500:80
+ EVDEV_ABS_24=0:1023:500
 
 # WALTOP International Corp. Graphics Tablet
 evdev:input:b0003v172Fp0047*

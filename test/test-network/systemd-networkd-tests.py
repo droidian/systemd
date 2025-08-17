@@ -7,13 +7,21 @@
 #
 # To run an individual test, specify it as a command line argument in the form
 # of <class>.<test_function>. E.g. the NetworkdMTUTests class has a test
-# function called test_ipv6_mtu().  To run just that test use:
+# function called test_ipv6_mtu(). To run just that test use:
 #
-#    sudo ./systemd-networkd-tests.py NetworkdMTUTests.test_ipv6_mtu
+#    run0 ./systemd-networkd-tests.py NetworkdMTUTests.test_ipv6_mtu
 #
-# Similarly, other individual tests can be run, eg.:
+# Similarly, other individual tests can be run, e.g.:
 #
-#    sudo ./systemd-networkd-tests.py NetworkdNetworkTests.test_ipv6_neigh_retrans_time
+#    run0 ./systemd-networkd-tests.py NetworkdNetworkTests.test_ipv6_neigh_retrans_time
+#
+# To run the test with the executables (systemd-networkd, networkctl, systemd-udevd and so on)
+# in your build directory, --build-dir=/path/to/build/ option can be used:
+#
+#    run0 ./systemd-networkd-tests.py --build-dir=/path/to/build NetworkdNetworkTests.test_address_static
+#
+# Note, unlike the long getopt option handling, the path must be specified after '=', rather than space.
+# Otherwise the path is recognized as a test case, and the test run will fail.
 
 import argparse
 import datetime
@@ -32,6 +40,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -3221,6 +3230,17 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
     def tearDown(self):
         tear_down_common()
 
+    def test_ID_NET_MANAGED_BY(self):
+        copy_network_unit('11-dummy.netdev', '11-dummy-unmanaged.link', '11-dummy.network')
+        start_networkd()
+        self.wait_online('test1:off', setup_state='unmanaged')
+
+        check_output('ip link set dev test1 up')
+        self.wait_online('test1:degraded', setup_state='unmanaged')
+
+        check_output('ip link set dev test1 down')
+        self.wait_online('test1:off', setup_state='unmanaged')
+
     def verify_address_static(
             self,
             label1: str,
@@ -3722,6 +3742,34 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         print(output)
         self.assertIn('104:	from 10.1.0.0/16 iif test1 lookup 12 nop', output)
 
+        output = check_output('ip rule list iif test1 priority 200')
+        print(output)
+        self.assertIn('200:	from all fwmark 0/0x1 iif test1 lookup 20', output)
+
+        output = check_output('ip rule list iif test1 priority 201')
+        print(output)
+        self.assertIn('201:	from all fwmark 0x7/0xff iif test1 lookup 21', output)
+
+        output = check_output('ip rule list iif test1 priority 202')
+        print(output)
+        self.assertIn('202:	from all fwmark 0x270f iif test1 lookup 22', output)
+
+        output = check_output('ip rule list to 192.0.2.0/26')
+        print(output)
+        self.assertIn('to 192.0.2.0/26 lookup 1001', output)
+
+        output = check_output('ip rule list to 192.0.2.64/26')
+        print(output)
+        self.assertIn('to 192.0.2.64/26 lookup 1001', output)
+
+        output = check_output('ip rule list to 192.0.2.128/26')
+        print(output)
+        self.assertIn('to 192.0.2.128/26 lookup 1001', output)
+
+        output = check_output('ip rule list to 192.0.2.192/26')
+        print(output)
+        self.assertIn('to 192.0.2.192/26 lookup 1001', output)
+
     def check_routing_policy_rule_dummy98(self):
         print('### Checking routing policy rules requested by dummy98')
 
@@ -3857,6 +3905,45 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         output = check_output('ip -6 rule list table 1011')
         print(output)
         self.assertIn('10113:	from all iif test1 lookup 1011', output)
+
+    def test_routing_policy_rule_manual(self):
+        # For issue #36244.
+        copy_network_unit(
+            '11-dummy.netdev',
+            '25-routing-policy-rule-manual.network')
+        start_networkd()
+        self.wait_operstate('test1', operstate='off', setup_state='configuring', setup_timeout=20)
+
+        check_output('ip link add test2 type dummy')
+        self.wait_operstate('test2', operstate='off', setup_state='configuring', setup_timeout=20)
+
+        networkctl('up', 'test2')
+        self.wait_online('test2:degraded')
+
+        # The request for the routing policy rules are bound to test1. Hence, we need to wait for the rules
+        # being configured explicitly.
+        for _ in range(20):
+            time.sleep(0.5)
+
+            output = check_output('ip -4 rule list table 51819')
+            if output != '10:	from all lookup 51819 suppress_prefixlength 0 proto static':
+                continue
+
+            output = check_output('ip -6 rule list table 51819')
+            if output != '10:	from all lookup 51819 suppress_prefixlength 0 proto static':
+                continue
+
+            output = check_output('ip -4 rule list table 51820')
+            if output != '11:	not from all fwmark 0x38f lookup 51820 proto static':
+                continue
+
+            output = check_output('ip -6 rule list table 51820')
+            if output != '11:	not from all fwmark 0x38f lookup 51820 proto static':
+                continue
+
+            break
+        else:
+            self.assertFalse(True)
 
     @expectedFailureIfRoutingPolicyPortRangeIsNotAvailable()
     def test_routing_policy_rule_port_range(self):
@@ -4756,6 +4843,24 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         self.assertRegex(output, 'DNS: 192.168.42.1')
         self.assertRegex(output, 'Search Domains: one')
 
+    def test_keep_configuration_yes(self):
+        check_output('ip link add dummy98 type dummy')
+        check_output('ip link set dev dummy98 up')
+        check_output('ip address add 198.51.100.1/24 brd 198.51.100.255 dev dummy98')
+        check_output('ip route add 203.0.113.0/24 via 198.51.100.10 dev dummy98 proto boot')
+
+        copy_network_unit('24-keep-configuration-yes.network')
+        start_networkd()
+        self.wait_online('dummy98:routable')
+
+        output = check_output('ip address show dummy98')
+        print(output)
+        self.assertIn('inet 198.51.100.1/24 brd 198.51.100.255 scope global dummy98', output)
+
+        output = check_output('ip -d -4 route show dev dummy98')
+        print(output)
+        self.assertIn('203.0.113.0/24 via 198.51.100.10 proto boot', output)
+
     def test_keep_configuration_static(self):
         check_output('ip link add name dummy98 type dummy')
         check_output('ip address add 10.1.2.3/16 dev dummy98')
@@ -4775,6 +4880,62 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         print(output)
         self.assertRegex(output, 'inet 10.1.2.3/16 scope global dummy98')
         self.assertNotRegex(output, 'inet 10.2.3.4/16 scope global dynamic dummy98')
+
+    def check_keep_configuration_on_restart(self):
+        self.wait_online('dummy98:routable')
+        self.wait_online('unmanaged0:routable', setup_state='unmanaged')
+
+        print('### ip -6 address show dev dummy98')
+        output = check_output('ip -6 address show dev dummy98')
+        print(output)
+        self.assertIn('inet6 2001:db8:0:f101::15/64 scope global', output)
+        self.assertIn('inet6 2001:db8:1:f101::15/64 scope global deprecated', output)
+
+        print('### ip -6 address show dev unmanaged0')
+        output = check_output('ip -6 address show dev unmanaged0')
+        print(output)
+        self.assertIn('inet6 2001:db8:9999:f101::15/64 scope global', output)
+
+        print('### ip -6 route show default dev dummy98')
+        output = check_output('ip -6 route show default dev dummy98')
+        print(output)
+        self.assertIn('default via fe80::f0ca:cc1a proto static metric 1 pref medium', output)
+
+    def test_keep_configuration_on_restart(self):
+        # Add an unmanaged interface with an up address
+        call('ip link add unmanaged0 type dummy')
+        call('ip link set unmanaged0 up')
+        call('ip -6 addr add 2001:db8:9999:f101::15/64 dev unmanaged0')
+
+        copy_network_unit('12-dummy.netdev', '85-static-ipv6.network')
+        start_networkd()
+        self.check_keep_configuration_on_restart()
+
+        # Start `ip monitor` with output to a temporary file
+        with tempfile.TemporaryFile(mode='r+', prefix='ip_monitor') as logfile:
+            process = subprocess.Popen(['ip', 'monitor', 'dev', 'dummy98'], stdout=logfile, text=True)
+            restart_networkd()
+            self.check_keep_configuration_on_restart()
+
+            process.send_signal(signal.SIGTERM)
+            process.wait()
+
+            print('### ip monitor dev dummy98 BEGIN')
+
+            # Read the `ip monitor` output looking for network changes
+            logfile.seek(0)
+            for line in logfile:
+                print(line, end="")
+                # Check if a link went down
+                self.assertNotRegex(line, 'unmanaged0: .* state DOWN')
+                self.assertNotRegex(line, 'dummy98: .* state DOWN')
+                # Check if an address was removed
+                self.assertNotRegex(line, '^Deleted .* 2001:db8:')
+                self.assertNotRegex(line, '^Deleted 2001:db8:.*/64')
+                # Check if the default route was removed
+                self.assertNotRegex(line, '^Deleted default via fe80::f0ca:cc1a')
+
+            print('### ip monitor dev dummy98 END')
 
     def check_nexthop(self, manage_foreign_nexthops, first):
         self.wait_online('veth99:routable', 'veth-peer:routable', 'dummy98:routable')
@@ -5269,7 +5430,7 @@ class NetworkdTCTests(unittest.TestCase, Utilities):
         output = check_output('tc qdisc show dev dummy98')
         print(output)
         self.assertRegex(output, 'qdisc tbf 35: root')
-        self.assertRegex(output, 'rate 1Gbit burst 5000b peakrate 100Gbit minburst 987500b lat 70(.0)?ms')
+        self.assertRegex(output, 'rate 1Gbit burst 5000b peakrate 100Gbit minburst (987500b|999200b) lat 70(.0)?ms')
 
     @expectedFailureIfModuleIsNotAvailable('sch_teql')
     def test_qdisc_teql(self):
@@ -5440,6 +5601,21 @@ class NetworkdBondTests(unittest.TestCase, Utilities):
         output = check_output('ip -d link show dummy98')
         print(output)
         self.assertRegex(output, 'master bond199')
+
+        # Test case for #37629
+        for _ in range(3):
+            # When a slave leaved from its master bonding interface, the kernel brings down the slave.
+            check_output('ip link set dummy98 nomaster')
+            self.wait_online('dummy98:off')
+
+            # Bring up the interface to check if networkd recognizes the interface has no master now.
+            check_output('ip link set dummy98 up')
+            self.wait_online('dummy98:carrier')
+
+            # We need to first bring down the interface to make it join a bonding interface.
+            check_output('ip link set dummy98 down')
+            check_output('ip link set dummy98 master bond199')
+            self.wait_online('dummy98:enslaved')
 
     def test_bond_active_slave(self):
         copy_network_unit('23-active-slave.network', '23-bond199.network', '25-bond-active-backup-slave.netdev', '12-dummy.netdev')
@@ -8660,6 +8836,10 @@ if __name__ == '__main__':
         source_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../"))
     else:
         source_dir = None
+
+    if networkd_bin is None or resolved_bin is None or timesyncd_bin is None:
+        print("networkd tests require networkd/resolved/timesyncd to be enabled")
+        sys.exit(77)
 
     use_valgrind = ns.use_valgrind
     enable_debug = ns.enable_debug

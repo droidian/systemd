@@ -1,17 +1,15 @@
 Tests: timedated, hostnamed, localed-locale, localed-x11-keymap, logind
 Depends: systemd,
-  systemd-resolved,
   systemd-timesyncd,
   libpam-systemd,
   libnss-systemd,
   acl,
   locales,
   evemu-tools,
-Restrictions: needs-root, allow-stderr, isolation-container, skippable, breaks-testbed
+Restrictions: needs-root, allow-stderr, isolation-container, skippable
 
 Tests: unit-config
 Depends: systemd,
-  systemd-resolved,
   systemd-dev,
   libpam-systemd,
   libnss-systemd,
@@ -20,11 +18,10 @@ Depends: systemd,
   evemu-tools,
   python3,
   pkgconf,
-Restrictions: needs-root, allow-stderr, breaks-testbed
+Restrictions: needs-root, allow-stderr
 
 Tests: storage
 Depends: systemd,
-  systemd-resolved,
   systemd-cryptsetup,
   libpam-systemd,
   libnss-systemd,
@@ -34,7 +31,7 @@ Depends: systemd,
   python3,
   pkgconf,
   cryptsetup-bin,
-Restrictions: needs-root, isolation-machine, breaks-testbed
+Restrictions: needs-root, isolation-machine
 
 Tests: networkd-test.py
 Tests-Directory: test
@@ -53,11 +50,10 @@ Depends: systemd,
   polkitd,
   netlabel-tools,
   dnsmasq-base
-Restrictions: needs-root, isolation-container, breaks-testbed
+Restrictions: needs-root, isolation-container, breaks-testbed, skip-not-installable, skippable
 
 Tests: build-login
 Depends: systemd,
-  systemd-resolved,
   systemd-cryptsetup,
   libpam-systemd,
   libnss-systemd,
@@ -78,14 +74,13 @@ Tests: boot-and-services
 Depends: systemd-sysv,
   systemd-container,
   systemd-coredump,
-  systemd-resolved,
   systemd-dev,
   libpam-systemd,
   libdw-dev,
   libelf-dev,
   xserver-xorg-video-dummy,
   xserver-xorg,
-  gdm3 [!s390x !riscv64 !armel],
+  gdm3 [!s390x !riscv64 !armel !loong64],
   cron,
   network-manager,
   busybox-static,
@@ -96,11 +91,10 @@ Depends: systemd-sysv,
   python3,
   python3-pefile,
   dhcpcd-base | dhcpcd5,
-Restrictions: needs-root, isolation-container, breaks-testbed, allow-stderr
+Restrictions: needs-root, isolation-container, allow-stderr
 
 Tests: unit-tests
 Depends: systemd-tests,
-  systemd-resolved,
   libpam-systemd,
   libnss-myhostname,
   libnss-mymachines,
@@ -128,20 +122,18 @@ Depends: systemd-tests,
   libarchive-dev,
   libgcrypt20-dev,
   libcryptsetup-dev,
-  tzdata-legacy | tzdata (<< 2024b-3),
-Restrictions: needs-root, isolation-container, breaks-testbed
+  tzdata-legacy | tzdata,
+Restrictions: needs-root, isolation-container, skip-not-installable, skippable
 
 Tests: boot-smoke
 Depends: systemd-sysv,
-  systemd-resolved,
   network-manager,
-  gdm3 [!s390x !riscv64 !armel],
+  gdm3 [!s390x !riscv64 !armel !loong64],
   xserver-xorg-video-dummy,
-Restrictions: needs-root, isolation-container, allow-stderr, breaks-testbed
+Restrictions: needs-root, isolation-container, allow-stderr
 
 Tests: build-with-static-libsystemd
 Depends: systemd,
-  systemd-resolved,
   pkgconf,
   build-essential,
   libsystemd-dev,
@@ -155,7 +147,7 @@ Depends: systemd-tests,
   lsb-release,
   snapd,
   dnsmasq-base,
-Restrictions: needs-root, allow-stderr, isolation-machine, breaks-testbed, skip-not-installable, skippable, flaky
+Restrictions: needs-root, allow-stderr, isolation-machine, breaks-testbed, skip-not-installable, skippable
 
 # Dummy test so that changes to key packages trigger our autopkgtests on ci.debian.net
 Features: test-name=hint-testsuite-triggers
@@ -212,7 +204,7 @@ Depends:
   locales-all,
   stress,
   curl,
-  tzdata-legacy | tzdata (<< 2024b-3),
+  tzdata-legacy | tzdata,
   nvme-cli,
   mdadm,
   lvm2,
@@ -239,14 +231,12 @@ Depends: systemd (>= 254~),
   systemd-timesyncd,
   systemd-oomd,
   systemd-homed,
-  systemd-resolved,
-  systemd-boot [amd64 arm64 armhf i386 riscv64],
+  systemd-boot [amd64 arm64 armhf i386 loong64 riscv64],
   systemd-repart,
   systemd-cryptsetup,
-  systemd-boot-efi [amd64 arm64 armhf i386 riscv64],
+  systemd-boot-efi [amd64 arm64 armhf i386 loong64 riscv64],
   libnss-myhostname,
   libnss-mymachines,
-  libnss-resolve,
   libnss-systemd,
   libsystemd-dev,
   libudev-dev,
@@ -259,6 +249,7 @@ Depends: systemd (>= 254~),
   ovmf-ia32 [i386],
   qemu-efi-aarch64 [arm64],
   qemu-efi-arm [armhf],
+  qemu-efi-loongarch64 [loong64],
   qemu-efi-riscv64 [riscv64],
   seabios [ppc64el s390x],
   swtpm,
@@ -266,6 +257,8 @@ Depends: systemd (>= 254~),
   tpm2-tools,
   git,
   ca-certificates,
+  debian-archive-keyring,
+  ubuntu-keyring,
   build-essential,
   pkgconf,
   libcap-dev,
@@ -277,7 +270,7 @@ Depends: systemd (>= 254~),
   libblkid-dev,
   libcap-dev,
   python3-pefile,
-  sbsigntool [amd64 arm64 armhf i386 riscv64],
+  sbsigntool [amd64 arm64 armhf i386 loong64 riscv64],
   mtools,
   bash,
   bubblewrap (>= 0.4~),
@@ -296,4 +289,4 @@ Depends: systemd (>= 254~),
   zstd,
   uidmap,
   jq,
-Restrictions: needs-root, allow-stderr, isolation-machine, needs-internet, breaks-testbed
+Restrictions: needs-root, allow-stderr, isolation-machine, needs-internet, breaks-testbed, skip-not-installable, skippable

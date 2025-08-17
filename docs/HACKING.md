@@ -7,125 +7,109 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 # Hacking on systemd
 
-We welcome all contributions to systemd.
-If you notice a bug or a missing feature, please feel invited to fix it, and submit your work as a
+We welcome all contributions to systemd. If you notice a bug or a missing
+feature, please feel invited to fix it, and submit your work as a
 [GitHub Pull Request (PR)](https://github.com/systemd/systemd/pull/new).
 
-Please make sure to follow our [Coding Style](/CODING_STYLE) when submitting patches.
-Also have a look at our [Contribution Guidelines](/CONTRIBUTING).
+Please make sure to follow our [Coding Style](/CODING_STYLE) when submitting
+patches. Also have a look at our [Contribution Guidelines](/CONTRIBUTING).
 
-When adding new functionality, tests should be added.
-For shared functionality (in `src/basic/` and `src/shared/`) unit tests should be sufficient.
-The general policy is to keep tests in matching files underneath `src/test/`,
-e.g. `src/test/test-path-util.c` contains tests for any functions in `src/basic/path-util.c`.
-If adding a new source file, consider adding a matching test executable.
-For features at a higher level, tests in `src/test/` are very strongly recommended.
-If that is not possible, integration tests in `test/` are encouraged.
+When adding new functionality, tests should be added. For shared functionality
+(in `src/basic/` and `src/shared/`) unit tests should be sufficient. The general
+policy is to keep tests in matching files underneath `src/test/`, e.g.
+`src/test/test-path-util.c` contains tests for any functions in
+`src/basic/path-util.c`. If adding a new source file, consider adding a matching
+test executable. For features at a higher level, tests in `src/test/` are very
+strongly recommended. If that is not possible, integration tests in `test/` are
+encouraged. Please always test your work before submitting a PR.
 
-Please always test your work before submitting a PR.
-For many of the components of systemd testing is straightforward as you can simply compile systemd and run the relevant tool from the build directory.
+## Hacking on systemd with mkosi
 
-For some components (most importantly, systemd/PID 1 itself) this is not possible, however.
-In order to simplify testing for cases like this we provide a set of `mkosi` config files directly in the source tree.
-[mkosi](https://mkosi.systemd.io/)
-is a tool for building clean OS images from an upstream distribution in combination with a fresh build of the project in the local working directory.
-To make use of this, please install `mkosi` from the [GitHub repository](https://github.com/systemd/mkosi#running-mkosi-from-the-repository).
-`mkosi` will build an image for the host distro by default.
-First, run `mkosi genkey` to generate a key and certificate to be used for secure boot and verity signing.
-After that is done, it is sufficient to type `mkosi` in the systemd project directory to generate a disk image you can boot either in `systemd-nspawn` or in a UEFI-capable VM:
+[mkosi](https://mkosi.systemd.io/) is our swiss army knife for hacking on
+systemd. It makes sure all necessary dependencies are available to build systemd
+and allows building and booting an OS image with the latest systemd installed
+for testing purposes.
+
+First, install `mkosi` from the
+[GitHub repository](https://github.com/systemd/mkosi#running-mkosi-from-the-repository)
+or via your distribution's package manager. Note that systemd regularly adopts
+newer mkosi features that are not in an official release yet so there's a good
+chance that your distribution's packaged version of mkosi will be too old.
+
+Then, you can build and run systemd executables as follows:
 
 ```sh
-$ sudo mkosi boot # nspawn still needs sudo for now
+$ mkosi -f genkey                                  # Generate signing keys once.
+$ mkosi -f sandbox -- meson setup -Dbpf-framework=disabled build # bpftool detection inside mkosi sandbox is broken on Ubuntu Noble and older
+$ mkosi -f sandbox -- meson compile -C build
+$ mkosi -f sandbox -- build/systemctl --version
 ```
 
-or:
+To build and boot an OS image with the latest systemd installed:
 
 ```sh
-$ mkosi qemu
+$ mkosi -f sandbox -- meson compile -C build mkosi # (re-)build the OS image
+$ mkosi boot                                       # Boot the image with systemd-nspawn.
+$ mkosi vm                                         # Boot the image with qemu.
 ```
 
-By default, the tools from your host system are used to build the image.
-Sometimes we start using mkosi features that rely on functionality in systemd
-tools that's not in an official release yet. In that case, you'll need to build
-systemd from source on the host and configure mkosi to use the tools from the
-systemd build directory.
-
-To do a local build, most distributions provide very simple and convenient ways
-to install most development packages necessary to build systemd:
+Putting this all together, here's a series of commands for preparing a patch for
+systemd:
 
 ```sh
-# Fedora
-$ sudo dnf builddep systemd
-# Debian/Ubuntu
-$ sudo apt-get build-dep systemd
-# Arch
-$ sudo pacman -S devtools
-$ pkgctl repo clone --protocol=https systemd
+$ git clone https://github.com/systemd/mkosi.git
+$ ln -s $PWD/mkosi/bin/mkosi ~/.local/bin/mkosi # Make sure ~/.local/bin is in $PATH.
+$ git clone https://github.com/systemd/systemd.git
 $ cd systemd
-$ makepkg -seoc
+$ git checkout -b <BRANCH>                         # where BRANCH is the name of the branch
+$ $EDITOR src/core/main.c                          # or wherever you'd like to make your changes
+$ mkosi -f genkey                                  # Generate signing keys once.
+$ mkosi -f sandbox -- meson setup build            # Set up meson
+$ mkosi -f sandbox -- meson compile -C build mkosi # (re-)build the test image
+$ mkosi vm                                         # Boot the image in qemu
+$ git add -p                                       # interactively put together your patch
+$ git commit                                       # commit it
+$ git push -u <REMOTE>                             # where REMOTE is your "fork" on GitHub
 ```
 
-After installing the development packages, systemd can be built from source as follows:
+And after that, head over to your repo on GitHub and click "Compare & pull
+request"
 
-```sh
-$ meson setup build <options>
-$ ninja -C build
-$ meson test -C build
-```
+Happy hacking!
 
-To have `mkosi` use the systemd tools from the `build/` directory, add the
-following to `mkosi.local.conf`:
+The following sections contain advanced topics on how to speed up development or
+streamline debugging. Feel free to read them if you're interested but they're
+not required to write basic patches.
+
+## Building the OS image without a tools tree
+
+By default, `mkosi` will first build a tools tree and use it build the image and
+provide the environment for `mkosi sandbox`. To disable the tools tree and use
+binaries from your host instead, write the following to `mkosi/mkosi.local.conf`:
 
 ```conf
-[Host]
-ExtraSearchPaths=build/
+[Build]
+ToolsTree=
 ```
 
-And if you want `mkosi` to build a tools image and use the tools from there
-instead of looking for tools on the host, add the following to
-`mkosi.local.conf`:
+## Rebuilding systemd without rebuilding the OS image
 
-```conf
-[Host]
-ToolsTree=default
-```
-
-Every time you rerun the `mkosi` command a fresh image is built, incorporating
-all current changes you made to the project tree. To build the latest changes
-and re-install after booting the image, run one of the following commands in
-another terminal on your host (choose the right one depending on the
-distribution of the container or virtual machine):
+Every time the `mkosi` target is built, a fresh image is built. To build the
+latest changes and re-install systemd without rebuilding the image, run one of
+the following commands in another terminal on your host after booting the image
+(choose the right one depending on the distribution of the container or virtual
+machine):
 
 ```sh
-mkosi -t none && mkosi ssh dnf upgrade --disablerepo="*" --assumeyes "/work/build/*.rpm"             # CentOS/Fedora
-mkosi -t none && mkosi ssh apt-get install "/work/build/*.deb"                                       # Debian/Ubuntu
-mkosi -t none && mkosi ssh pacman --upgrade --needed --noconfirm "/work/build/*.pkg.tar"             # Arch Linux
-mkosi -t none && mkosi ssh zypper --non-interactive install --allow-unsigned-rpm "/work/build/*.rpm" # OpenSUSE
+mkosi -R && mkosi ssh -- dnf upgrade --disablerepo="*" --assumeyes "/work/build/*.rpm"             # CentOS/Fedora
+mkosi -R && mkosi ssh -- apt-get install "/work/build/*.deb"                                       # Debian/Ubuntu
+mkosi -R && mkosi ssh -- pacman --upgrade --needed --noconfirm "/work/build/*.pkg.tar"             # Arch Linux
+mkosi -R && mkosi ssh -- zypper --non-interactive install --allow-unsigned-rpm "/work/build/*.rpm" # OpenSUSE
 ```
 
 and optionally restart the daemon(s) you're working on using
 `systemctl restart <units>` or `systemctl daemon-reexec` if you're working on
 pid1 or `systemctl soft-reboot` to restart everything.
-
-Putting this all together, here's a series of commands for preparing a patch for systemd:
-
-```sh
-$ git clone https://github.com/systemd/mkosi.git
-$ ln -s $PWD/mkosi/bin/mkosi /usr/local/bin/mkosi
-$ git clone https://github.com/systemd/systemd.git
-$ cd systemd
-$ git checkout -b <BRANCH>        # where BRANCH is the name of the branch
-$ vim src/core/main.c             # or wherever you'd like to make your changes
-$ mkosi -f qemu                   # (re-)build and boot up the test image in qemu
-$ mkosi -t none                   # Build new packages without rebuilding the image
-$ git add -p                      # interactively put together your patch
-$ git commit                      # commit it
-$ git push -u <REMOTE>            # where REMOTE is your "fork" on GitHub
-```
-
-And after that, head over to your repo on GitHub and click "Compare & pull request"
-
-Happy hacking!
 
 ## Building distribution packages with mkosi
 
@@ -133,7 +117,7 @@ To build distribution packages for a specific distribution and release without
 building an actual image, the following command can be used:
 
 ```sh
-mkosi -d <distribution> -r <release> -t none
+mkosi -d <distribution> -r <release> -t none -f
 ```
 
 Afterwards the distribution packages will be located in
@@ -141,38 +125,41 @@ Afterwards the distribution packages will be located in
 debuginfo packages, the following command can be used:
 
 ```sh
-mkosi -d <distribution> -r <release> -E WITH_DEBUG=1 -t none
+mkosi -d <distribution> -r <release> -E WITH_DEBUG=1 -t none -f
 ```
 
 To upgrade the systemd packages on the host system to the newer versions built
 by mkosi, run the following:
 
 ```sh
-dnf upgrade build/mkosi.builddir/<distribution>~<release>~<architecture>/*.rpm                                           # Fedora/CentOS
-apt-get install build/mkosi.builddir/<distribution>~<release>~<architecture>/*.deb                                       # Debian/Ubuntu
-pacman --upgrade --needed --noconfirm build/mkosi.builddir/<distribution>~<release>~<architecture>/*.pkg.tar             # Arch Linux
-zypper --non-interactive install --allow-unsigned-rpm build/mkosi.builddir/<distribution>~<release>~<architecture>/*.rpm # OpenSUSE
+run0 dnf upgrade build/mkosi.builddir/<distribution>~<release>~<architecture>/*.rpm                                           # Fedora/CentOS
+run0 apt-get install build/mkosi.builddir/<distribution>~<release>~<architecture>/*.deb                                       # Debian/Ubuntu
+run0 pacman --upgrade --needed --noconfirm build/mkosi.builddir/<distribution>~<release>~<architecture>/*.pkg.tar             # Arch Linux
+run0 zypper --non-interactive install --allow-unsigned-rpm build/mkosi.builddir/<distribution>~<release>~<architecture>/*.rpm # OpenSUSE
 ```
 
 To downgrade back to the old version shipped by the distribution, run the
 following:
 
 ```sh
-dnf downgrade "systemd*" # Fedora/CentOS
+run0 dnf downgrade "systemd*" # Fedora/CentOS
 # TODO: Other distributions
 ```
 
-Additionally, for each pull request, the built distribution packages are
-attached as CI artifacts to the pull request CI jobs, which means that users can
-download and install them to test out if a pull request fixes the issue that
-they reported. To download the packages from a pull request, click on the
-`Checks` tab. Then click on the `mkosi` workflow in the list of workflows on the
-left of the `Checks` page. Finally, scroll down to find the list of CI
-artifacts. In this list of artifacts you can find artifacts containing
-distribution packages. To install these, download the artifact which is a zip
-archive, extract the zip archive to access the individual packages, and install
-them with your package manager in the same way as described above for packages
-that were built locally.
+## Installing packages built from the main branch
+
+Packages for main distributions are built on the SUSE Open Build Service and
+repositories are published, so that they can be installed and upgraded easily.
+
+Instructions on how to add the repository for each supported distribution can
+[be found on OBS.](https://software.opensuse.org//download.html?project=system%3Asystemd&package=systemd)
+The `systemd-boot` file is signed for Secure Boot, the self-signed certificate
+can be downloaded for enrollment. For example, when using MOK Manager:
+
+```sh
+$ wget https://build.opensuse.org/projects/system:systemd/signing_keys/download?kind=ssl -O- | openssl x509 -inform pem -outform der -out obs.der
+$ run0 mokutil --import obs.der
+```
 
 ## Templating engines in .in files
 
@@ -203,13 +190,18 @@ See [Testing systemd using sanitizers](/TESTING_WITH_SANITIZERS) for more inform
 
 ## Fuzzers
 
-systemd includes fuzzers in `src/fuzz/` that use libFuzzer and are automatically run by [OSS-Fuzz](https://github.com/google/oss-fuzz) with sanitizers.
-To add a fuzz target, create a new `src/fuzz/fuzz-foo.c` file with a `LLVMFuzzerTestOneInput` function and add it to the list in `src/fuzz/meson.build`.
+systemd includes fuzzers in `src/fuzz/` that use libFuzzer and are automatically
+run by [OSS-Fuzz](https://github.com/google/oss-fuzz) with sanitizers. To add a
+fuzz target, create a new `src/fuzz/fuzz-foo.c` file with a
+`LLVMFuzzerTestOneInput` function and add it to the list in
+`src/fuzz/meson.build`.
 
-Whenever possible, a seed corpus and a dictionary should also be added with new fuzz targets.
-The dictionary should be named `src/fuzz/fuzz-foo.dict` and the seed corpus should be built and exported as `$OUT/fuzz-foo_seed_corpus.zip` in `tools/oss-fuzz.sh`.
+Whenever possible, a seed corpus and a dictionary should also be added with new
+fuzz targets. The dictionary should be named `src/fuzz/fuzz-foo.dict` and the
+seed corpus should be built and exported as `$OUT/fuzz-foo_seed_corpus.zip` in
+`tools/oss-fuzz.sh`.
 
-The fuzzers can be built locally if you have libFuzzer installed by running `tools/oss-fuzz.sh`, or by running:
+The fuzzers can be built locally by running `tools/oss-fuzz.sh`, or by running:
 
 ```sh
 CC=clang CXX=clang++ \
@@ -218,15 +210,16 @@ meson setup build-libfuzz -Dllvm-fuzz=true -Db_sanitize=address,undefined -Db_lu
 ninja -C build-libfuzz fuzzers
 ```
 
-Each fuzzer then can be then run manually together with a directory containing the initial corpus:
+Each fuzzer then can be then run manually together with a directory containing
+the initial corpus:
 
 ```
 export UBSAN_OPTIONS=print_stacktrace=1:print_summary=1:halt_on_error=1
 build-libfuzz/fuzz-varlink-idl test/fuzz/fuzz-varlink-idl/
 ```
 
-Note: the `halt_on_error=1` UBSan option is especially important,
-otherwise the fuzzer won't crash when undefined behavior is triggered.
+Note: the `halt_on_error=1` UBSan option is especially important, otherwise the
+fuzzer won't crash when undefined behavior is triggered.
 
 You should also confirm that the fuzzers can be built and run using
 [the OSS-Fuzz toolchain](https://google.github.io/oss-fuzz/advanced-topics/reproducing/#building-using-docker):
@@ -254,8 +247,9 @@ done
 ./infra/helper.py coverage --no-corpus-download systemd
 ```
 
-If you find a bug that impacts the security of systemd,
-please follow the guidance in [CONTRIBUTING.md](/CONTRIBUTING) on how to report a security vulnerability.
+If you find a bug that impacts the security of systemd, please follow the
+guidance in [CONTRIBUTING.md](/CONTRIBUTING) on how to report a security
+vulnerability.
 
 For more details on building fuzzers and integrating with OSS-Fuzz, visit:
 
@@ -290,7 +284,7 @@ To simplify debugging systemd when testing changes using mkosi, we're going to s
 
 To allow VSCode's debugger to attach to systemd running in a mkosi image,
 we have to make sure it can access the virtual machine spawned by mkosi where systemd is running.
-After booting the image with `mkosi qemu`,
+After booting the image with `mkosi vm`,
 you should now be able to connect to it by running `mkosi ssh` from the same directory in another terminal window.
 
 Now we need to configure VSCode.
@@ -382,14 +376,25 @@ To debug systemd-boot in an IDE such as VSCode we can use a launch configuration
 
 [clangd](https://clangd.llvm.org/) is a language server that provides code completion, diagnostics and more
 right in your editor of choice (with the right plugin installed). When using mkosi, we can run clangd in the
-mkosi build container to avoid needing to build systemd on the host machine just to make clangd work.
+mkosi tools tree to avoid needing to install clangd on the host machine.
 
-All that is required is to run `mkosi` once to make sure cached images are available and to modify the path of the
-clangd binary used by your editor to the `mkosi.clangd` script included in the systemd repository. For example, for
-VScode, you'd have to add the following to the VSCode workspace settings of the systemd repository:
+All that is required is to run `mkosi -f sandbox true` once to make sure the tools tree is available and to modify
+the path of the clangd binary used by your editor to the `mkosi.clangd` script included in the systemd repository.
+For example, for VScode, you'd have to add the following to the VSCode workspace settings of the systemd repository:
 
 ```json
 {
-    "clangd.path": "<path-to-systemd-repository>/mkosi.clangd",
+    "clangd.path": "<path-to-systemd-repository>/mkosi/mkosi.clangd",
 }
+```
+
+The script passes any arguments it receives directly to clangd which you can use
+for example to tell clangd where the compilation database can be found using the
+`--compile-commands-dir=` option.
+
+When using clangd, it's recommended to setup the build directory containing the
+compilation database used by clangd to use clang as the compiler as well:
+
+```sh
+$ mkosi sandbox -- env CC=clang CXX=clang++ meson setup build
 ```

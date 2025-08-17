@@ -208,7 +208,7 @@ endif
 ############################################################
 
 buildroot_substs = configuration_data()
-buildroot_substs.set_quoted('BUILD_ROOT', project_build_root)
+buildroot_substs.set_quoted('BUILD_ROOT', meson.project_build_root())
 
 configure_file(
         input : 'man.in',
@@ -225,14 +225,15 @@ configure_file(
 update_dbus_docs = custom_target(
         'update-dbus-docs-impl',
         output : 'update-dbus-docs',
-        command : [update_dbus_docs_py, '--build-dir', project_build_root, '@INPUT@'],
-        input : dbus_docs)
+        command : [update_dbus_docs_py, '--build-dir', meson.project_build_root(), '@INPUT@'],
+        input : dbus_docs,
+        depends : dbus_programs)
 
 if conf.get('BUILD_MODE_DEVELOPER') == 1
         test('dbus-docs-fresh',
              update_dbus_docs_py,
              suite : 'dist',
-             args : ['--build-dir', project_build_root, '--test', dbus_docs],
+             args : ['--build-dir', meson.project_build_root(), '--test', dbus_docs],
              depends : dbus_programs)
 
         test('check-version-history',
@@ -245,7 +246,7 @@ update_man_rules = custom_target(
         'update-man-rules-impl',
         output : 'update-man-rules',
         command : [update_man_rules_py,
-                   '@0@/man/*.xml'.format(project_source_root),
+                   '@0@/man/*.xml'.format(meson.project_source_root()),
                    '@0@/rules/meson.build'.format(meson.current_source_dir())],
         depends : man_page_depends)
 
@@ -271,6 +272,7 @@ simple_examples = files(
         'sd-bus-container-read.c',
         'sd_bus_error-example.c',
         'sd_bus_service_reconnect.c',
+        'sd_device_enumerator_new-example.c',
         'send-unit-files-changed.c',
         'vtable-example.c',
 )

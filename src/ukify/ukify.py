@@ -175,9 +175,9 @@ def get_zboot_kernel(f: IO[bytes]) -> bytes:
         raise NotImplementedError('lzo decompression not implemented')
     elif comp_type.startswith(b'xzkern'):
         raise NotImplementedError('xzkern decompression not implemented')
-    elif comp_type.startswith(b'zstd22'):
-        zstd = try_import('zstd')
-        return cast(bytes, zstd.uncompress(f.read(size)))
+    elif comp_type.startswith(b'zstd'):
+        zstd = try_import('zstandard')
+        return cast(bytes, zstd.ZstdDecompressor().stream_reader(f.read(size)).read())
 
     raise NotImplementedError(f'unknown compressed type: {comp_type!r}')
 
@@ -207,15 +207,15 @@ def maybe_decompress(filename: Union[str, Path]) -> bytes:
         return cast(bytes, gzip.open(f).read())
 
     if start.startswith(b'\x28\xb5\x2f\xfd'):
-        zstd = try_import('zstd')
-        return cast(bytes, zstd.uncompress(f.read()))
+        zstd = try_import('zstandard')
+        return cast(bytes, zstd.ZstdDecompressor().stream_reader(f.read()).read())
 
     if start.startswith(b'\x02\x21\x4c\x18'):
         lz4 = try_import('lz4.frame', 'lz4')
         return cast(bytes, lz4.frame.decompress(f.read()))
 
     if start.startswith(b'\x04\x22\x4d\x18'):
-        print('Newer lz4 stream format detected! This may not boot!')
+        print('Newer lz4 stream format detected! This may not boot!', file=sys.stderr)
         lz4 = try_import('lz4.frame', 'lz4')
         return cast(bytes, lz4.frame.decompress(f.read()))
 
@@ -324,7 +324,7 @@ class Uname:
             filename,
         ]
 
-        print('+', shell_join(cmd))
+        print('+', shell_join(cmd), file=sys.stderr)
         try:
             notes = subprocess.check_output(cmd, stderr=subprocess.PIPE, text=True)
         except subprocess.CalledProcessError as e:
@@ -355,10 +355,10 @@ class Uname:
         for func in (cls.scrape_x86, cls.scrape_elf, cls.scrape_generic):
             try:
                 version = func(filename, opts=opts)
-                print(f'Found uname version: {version}')
+                print(f'Found uname version: {version}', file=sys.stderr)
                 return version
             except ValueError as e:
-                print(str(e))
+                print(str(e), file=sys.stderr)
         return None
 
 
@@ -388,7 +388,6 @@ class Section:
     tmpfile: Optional[IO[Any]] = None
     measure: bool = False
     output_mode: Optional[str] = None
-    virtual_size: Optional[int] = None
 
     @classmethod
     def create(cls, name: str, contents: Union[str, bytes, Path, None], **kwargs: Any) -> 'Section':
@@ -496,7 +495,7 @@ class PeSign(SignTool):
             '-o', output_f,
         ]  # fmt: skip
 
-        print('+', shell_join(cmd))
+        print('+', shell_join(cmd), file=sys.stderr)
         subprocess.check_call(cmd)
 
     @staticmethod
@@ -506,7 +505,7 @@ class PeSign(SignTool):
         tool = find_tool('pesign', opts=opts)
         cmd = [tool, '-i', opts.linux, '-S']
 
-        print('+', shell_join(cmd))
+        print('+', shell_join(cmd), file=sys.stderr)
         info = subprocess.check_output(cmd, text=True)
 
         return 'No signatures found.' in info
@@ -528,7 +527,7 @@ class SbSign(SignTool):
             '--output', output_f,
         ]  # fmt: skip
 
-        print('+', shell_join(cmd))
+        print('+', shell_join(cmd), file=sys.stderr)
         subprocess.check_call(cmd)
 
     @staticmethod
@@ -538,7 +537,7 @@ class SbSign(SignTool):
         tool = find_tool('sbverify', opts=opts)
         cmd = [tool, '--list', opts.linux]
 
-        print('+', shell_join(cmd))
+        print('+', shell_join(cmd), file=sys.stderr)
         info = subprocess.check_output(cmd, text=True)
 
         return 'No signature table present' in info
@@ -580,7 +579,7 @@ class SystemdSbSign(SignTool):
             '--output', output_f,
         ]  # fmt: skip
 
-        print('+', shell_join(cmd))
+        print('+', shell_join(cmd), file=sys.stderr)
         subprocess.check_call(cmd)
 
     @staticmethod
@@ -627,7 +626,7 @@ def check_splash(filename: Optional[Path]) -> None:
         return
 
     img = Image.open(filename, formats=['BMP'])
-    print(f'Splash image {filename} is {img.width}×{img.height} pixels')
+    print(f'Splash image {filename} is {img.width}×{img.height} pixels', file=sys.stderr)
 
 
 def check_inputs(opts: UkifyConfig) -> None:
@@ -711,6 +710,10 @@ def pe_strip_section_name(name: bytes) -> str:
     return name.rstrip(b'\x00').decode()
 
 
+def pe_section_size(section: pefile.SectionStructure) -> int:
+    return cast(int, min(section.Misc_VirtualSize, section.SizeOfRawData))
+
+
 def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) -> None:
     measure_tool = find_tool(
         'systemd-measure',
@@ -763,14 +766,14 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
             cmd = [
                 measure_tool,
                 'calculate',
-                *(f"--{s.name.removeprefix('.')}={s.content}" for s in to_measure.values()),
+                *(f'--{s.name.removeprefix(".")}={s.content}' for s in to_measure.values()),
                 *(f'--bank={bank}' for bank in banks),
                 # For measurement, the keys are not relevant, so we can lump all the phase paths
                 # into one call to systemd-measure calculate.
                 *(f'--phase={phase_path}' for phase_path in itertools.chain.from_iterable(pp_groups)),
             ]
 
-            print('+', shell_join(cmd))
+            print('+', shell_join(cmd), file=sys.stderr)
             subprocess.check_call(cmd)
 
     # PCR signing
@@ -786,7 +789,7 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
             cmd = [
                 measure_tool,
                 'sign',
-                *(f"--{s.name.removeprefix('.')}={s.content}" for s in to_measure.values()),
+                *(f'--{s.name.removeprefix(".")}={s.content}' for s in to_measure.values()),
                 *(f'--bank={bank}' for bank in banks),
             ]
 
@@ -808,7 +811,7 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
 
                 extra += [f'--phase={phase_path}' for phase_path in group or ()]
 
-                print('+', shell_join(cmd + extra))  # type: ignore
+                print('+', shell_join(cmd + extra), file=sys.stderr)  # type: ignore
                 pcrsig = subprocess.check_output(cmd + extra, text=True)  # type: ignore
                 pcrsig = json.loads(pcrsig)
                 pcrsigs += [pcrsig]
@@ -893,8 +896,14 @@ def pe_add_sections(uki: UKI, output: str) -> None:
     )
     pe = pefile.PE(data=pe.write(), fast_load=True)
 
+    # pefile has an hardcoded limit of 256MB, which is not enough when building an initrd with large firmware
+    # files and all kernel modules. See: https://github.com/erocarrera/pefile/issues/396
     warnings = pe.get_warnings()
-    if warnings:
+    for w in warnings:
+        if 'VirtualSize is extremely large' in w:
+            continue
+        if 'VirtualAddress is beyond' in w:
+            continue
         raise PEError(f'pefile warnings treated as errors: {warnings}')
 
     security = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']]
@@ -918,10 +927,7 @@ def pe_add_sections(uki: UKI, output: str) -> None:
 
         new_section.set_file_offset(offset)
         new_section.Name = section.name.encode()
-        if section.virtual_size is not None:
-            new_section.Misc_VirtualSize = section.virtual_size
-        else:
-            new_section.Misc_VirtualSize = len(data)
+        new_section.Misc_VirtualSize = len(data)
         # Non-stripped stubs might still have an unaligned symbol table at the end, making their size
         # unaligned, so we make sure to explicitly pad the pointer to new sections to an aligned offset.
         new_section.PointerToRawData = round_up(len(pe.__data__), pe.OPTIONAL_HEADER.FileAlignment)
@@ -985,14 +991,14 @@ def merge_sbat(input_pe: list[Path], input_text: list[str]) -> str:
         try:
             pe = pefile.PE(f, fast_load=True)
         except pefile.PEFormatError:
-            print(f'{f} is not a valid PE file, not extracting SBAT section.')
+            print(f'{f} is not a valid PE file, not extracting SBAT section.', file=sys.stderr)
             continue
 
         for section in pe.sections:
             if pe_strip_section_name(section.Name) == '.sbat':
                 split = section.get_data().rstrip(b'\x00').decode().splitlines()
                 if not split[0].startswith('sbat,'):
-                    print(f'{f} does not contain a valid SBAT section, skipping.')
+                    print(f'{f} does not contain a valid SBAT section, skipping.', file=sys.stderr)
                     continue
                 # Filter out the sbat line, we'll add it back later, there needs to be only one and it
                 # needs to be first.
@@ -1003,7 +1009,7 @@ def merge_sbat(input_pe: list[Path], input_text: list[str]) -> str:
             t = Path(t[1:]).read_text()
         split = t.splitlines()
         if not split[0].startswith('sbat,'):
-            print(f'{t} does not contain a valid SBAT section, skipping.')
+            print(f'{t} does not contain a valid SBAT section, skipping.', file=sys.stderr)
             continue
         sbat += split[1:]
 
@@ -1104,7 +1110,22 @@ def make_uki(opts: UkifyConfig) -> None:
     sign_kernel = opts.sign_kernel
     linux = opts.linux
 
-    if opts.linux and sign_args_present:
+    # On some distros, on some architectures, the vmlinuz is a gzip file, so we need to decompress it
+    # if it's not a valid PE file, as it will fail to be booted by the firmware.
+    if linux:
+        try:
+            pefile.PE(linux, fast_load=True)
+        except pefile.PEFormatError:
+            try:
+                decompressed = maybe_decompress(linux)
+            except NotImplementedError:
+                print(f'{linux} is not a valid PE file and cannot be decompressed either', file=sys.stderr)
+            else:
+                print(f'{linux} is compressed and cannot be loaded by UEFI, decompressing', file=sys.stderr)
+                linux = Path(tempfile.NamedTemporaryFile(prefix='linux-decompressed').name)
+                linux.write_bytes(decompressed)
+
+    if linux and sign_args_present:
         assert opts.signtool is not None
         signtool = SignTool.from_string(opts.signtool)
 
@@ -1114,12 +1135,12 @@ def make_uki(opts: UkifyConfig) -> None:
 
         if sign_kernel:
             linux_signed = tempfile.NamedTemporaryFile(prefix='linux-signed')
+            signtool.sign(os.fspath(linux), os.fspath(Path(linux_signed.name)), opts=opts)
             linux = Path(linux_signed.name)
-            signtool.sign(os.fspath(opts.linux), os.fspath(linux), opts=opts)
 
-    if opts.uname is None and opts.linux is not None:
-        print('Kernel version not specified, starting autodetection 😖.')
-        opts.uname = Uname.scrape(opts.linux, opts=opts)
+    if opts.uname is None and linux is not None:
+        print('Kernel version not specified, starting autodetection 😖.', file=sys.stderr)
+        opts.uname = Uname.scrape(linux, opts=opts)
 
     uki = UKI(opts.stub)
     initrd = join_initrds(opts.initrd)
@@ -1136,7 +1157,7 @@ def make_uki(opts: UkifyConfig) -> None:
                 if opts.certificate_provider:
                     cmd += ['--certificate-source', f'provider:{opts.certificate_provider}']
 
-                print('+', shell_join(cmd))
+                print('+', shell_join(cmd), file=sys.stderr)
                 pcrpkey = subprocess.check_output(cmd)
             else:
                 pcrpkey = Path(opts.pcr_public_keys[0])
@@ -1148,7 +1169,7 @@ def make_uki(opts: UkifyConfig) -> None:
             if opts.signing_provider:
                 cmd += ['--private-key-source', f'provider:{opts.signing_provider}']
 
-            print('+', shell_join(cmd))
+            print('+', shell_join(cmd), file=sys.stderr)
             pcrpkey = subprocess.check_output(cmd)
 
     hwids = None
@@ -1166,6 +1187,7 @@ def make_uki(opts: UkifyConfig) -> None:
         ('.uname',   opts.uname,      True),
         ('.splash',  opts.splash,     True),
         ('.pcrpkey', pcrpkey,         True),
+        ('.linux',   linux,           True),
         ('.initrd',  initrd,          True),
         ('.ucode',   opts.microcode,  True),
     ]  # fmt: skip
@@ -1181,15 +1203,6 @@ def make_uki(opts: UkifyConfig) -> None:
     # systemd-measure doesn't know about those extra sections
     for section in opts.sections:
         uki.add_section(section)
-
-    if linux is not None:
-        try:
-            virtual_size = pefile.PE(linux, fast_load=True).OPTIONAL_HEADER.SizeOfImage
-        except pefile.PEFormatError:
-            print(f'{linux} is not a valid PE file, not using SizeOfImage.')
-            virtual_size = None
-
-        uki.add_section(Section.create('.linux', linux, measure=True, virtual_size=virtual_size))
 
     # Don't add a sbat section to profile PE binaries.
     if opts.join_profiles or not opts.profile:
@@ -1255,9 +1268,12 @@ def make_uki(opts: UkifyConfig) -> None:
             if n not in to_import:
                 continue
 
-            print(f"Copying section '{n}' from '{profile}': {pesection.Misc_VirtualSize} bytes")
+            print(
+                f"Copying section '{n}' from '{profile}': {pe_section_size(pesection)} bytes",
+                file=sys.stderr,
+            )
             uki.add_section(
-                Section.create(n, pesection.get_data(length=pesection.Misc_VirtualSize), measure=True)
+                Section.create(n, pesection.get_data(length=pe_section_size(pesection)), measure=True)
             )
 
         call_systemd_measure(uki, opts=opts, profile_start=prev_len)
@@ -1284,7 +1300,7 @@ def make_uki(opts: UkifyConfig) -> None:
         os.umask(umask := os.umask(0))
         os.chmod(opts.output, 0o777 & ~umask)
 
-    print(f"Wrote {'signed' if sign_args_present else 'unsigned'} {opts.output}")
+    print(f'Wrote {"signed" if sign_args_present else "unsigned"} {opts.output}', file=sys.stderr)
 
 
 @contextlib.contextmanager
@@ -1397,10 +1413,10 @@ def generate_keys(opts: UkifyConfig) -> None:
             common_name=cn,
             valid_days=opts.sb_cert_validity,
         )
-        print(f'Writing SecureBoot private key to {opts.sb_key}')
+        print(f'Writing SecureBoot private key to {opts.sb_key}', file=sys.stderr)
         with temporary_umask(0o077):
             Path(opts.sb_key).write_bytes(key_pem)
-        print(f'Writing SecureBoot certificate to {opts.sb_cert}')
+        print(f'Writing SecureBoot certificate to {opts.sb_cert}', file=sys.stderr)
         Path(opts.sb_cert).write_bytes(cert_pem)
 
         work = True
@@ -1408,11 +1424,11 @@ def generate_keys(opts: UkifyConfig) -> None:
     for priv_key, pub_key, _ in key_path_groups(opts):
         priv_key_pem, pub_key_pem = generate_priv_pub_key_pair()
 
-        print(f'Writing private key for PCR signing to {priv_key}')
+        print(f'Writing private key for PCR signing to {priv_key}', file=sys.stderr)
         with temporary_umask(0o077):
             Path(priv_key).write_bytes(priv_key_pem)
         if pub_key:
-            print(f'Writing public key for PCR signing to {pub_key}')
+            print(f'Writing public key for PCR signing to {pub_key}', file=sys.stderr)
             Path(pub_key).write_bytes(pub_key_pem)
 
         work = True
@@ -1437,12 +1453,11 @@ def inspect_section(
 
     ttype = config.output_mode if config else DEFAULT_SECTIONS_TO_SHOW.get(name, 'binary')
 
-    size = section.Misc_VirtualSize
-    # TODO: Use ignore_padding once we can depend on a newer version of pefile
+    size = pe_section_size(section)
     data = section.get_data(length=size)
     digest = sha256(data).hexdigest()
 
-    struct = {
+    struct: dict[str, Union[int, str]] = {
         'size': size,
         'sha256': digest,
     }
@@ -1451,7 +1466,7 @@ def inspect_section(
         try:
             struct['text'] = data.decode()
         except UnicodeDecodeError as e:
-            print(f'Section {name!r} is not valid text: {e}')
+            print(f'Section {name!r} is not valid text: {e}', file=sys.stderr)
             struct['text'] = '(not valid UTF-8)'
 
     if config and config.content:
@@ -1461,7 +1476,7 @@ def inspect_section(
     if opts.json == 'off':
         print(f'{name}:\n  size: {size} bytes\n  sha256: {digest}')
         if ttype == 'text':
-            text = textwrap.indent(struct['text'].rstrip(), ' ' * 4)
+            text = textwrap.indent(cast(str, struct['text']).rstrip(), ' ' * 4)
             print(f'  text:\n{text}')
 
     return name, struct
@@ -1772,7 +1787,7 @@ CONFIG_ITEMS = [
     ConfigItem(
         '--efi-arch',
         metavar='ARCH',
-        choices=('ia32', 'x64', 'arm', 'aa64', 'riscv64'),
+        choices=('ia32', 'x64', 'arm', 'aa64', 'riscv32', 'riscv64', 'loongarch32', 'loongarch64'),
         help='target EFI architecture',
         config_key='UKI/EFIArch',
     ),
@@ -1936,14 +1951,14 @@ def apply_config(namespace: argparse.Namespace, filename: Union[str, Path, None]
         if namespace.config:
             # Config set by the user, use that.
             filename = namespace.config
-            print(f'Using config file: {filename}')
+            print(f'Using config file: {filename}', file=sys.stderr)
         else:
             # Try to look for a config file then use the first one found.
             for config_dir in DEFAULT_CONFIG_DIRS:
                 filename = Path(config_dir) / DEFAULT_CONFIG_FILE
                 if filename.is_file():
                     # Found a config file, use it.
-                    print(f'Using found config file: {filename}')
+                    print(f'Using found config file: {filename}', file=sys.stderr)
                     break
             else:
                 # No config file specified or found, nothing to do.
@@ -1984,7 +1999,7 @@ def apply_config(namespace: argparse.Namespace, filename: Union[str, Path, None]
             if item := CONFIGFILE_ITEMS.get(f'{section_name}/{key}'):
                 item.apply_config(namespace, section_name, group, key, value)
             else:
-                print(f'Unknown config setting [{section_name}] {key}=')
+                print(f'Unknown config setting [{section_name}] {key}=', file=sys.stderr)
 
 
 def config_example() -> Iterator[str]:
@@ -2067,7 +2082,7 @@ def finalize_options(opts: argparse.Namespace) -> None:
     elif opts.linux or opts.initrd:
         raise ValueError('--linux=/--initrd= options cannot be used with positional arguments')
     else:
-        print("Assuming obsolete command line syntax with no verb. Please use 'build'.")
+        print("Assuming obsolete command line syntax with no verb. Please use 'build'.", file=sys.stderr)
         if opts.positional:
             opts.linux = Path(opts.positional[0])
         # If we have initrds from parsing config files, append our positional args at the end

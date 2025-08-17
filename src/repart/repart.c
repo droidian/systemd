@@ -1073,7 +1073,6 @@ static bool context_allocate_partitions(Context *context, uint64_t *ret_largest_
 
                 /* How much do we need to fit? */
                 required = partition_min_size_with_padding(context, p);
-                assert(required % context->grain_size == 0);
 
                 /* For existing partitions, we should verify that they'll actually fit */
                 if (PARTITION_EXISTS(p)) {
@@ -2311,7 +2310,7 @@ static int partition_finalize_fstype(Partition *p, const char *path) {
                 return log_oom();
 
         const char *v = secure_getenv(e);
-        if (!v || streq(p->format, v))
+        if (!v || streq_ptr(p->format, v))
                 return 0;
 
         log_syntax(NULL, LOG_NOTICE, path, 1, 0,
@@ -4322,7 +4321,7 @@ static int prepare_temporary_file(Context *context, PartitionTarget *t, uint64_t
 
         r = read_attr_fd(fdisk_get_devfd(context->fdisk_context), &attrs);
         if (r < 0 && !ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                return log_error_errno(r, "Failed to read file attributes of %s: %m", arg_node);
+                log_warning_errno(r, "Failed to read file attributes of %s, ignoring: %m", arg_node);
 
         if (FLAGS_SET(attrs, FS_NOCOW_FL)) {
                 r = chattr_fd(fd, FS_NOCOW_FL, FS_NOCOW_FL, NULL);
@@ -5992,7 +5991,8 @@ static int context_mkfs(Context *context) {
                         return r;
 
                 r = make_filesystem(partition_target_path(t), p->format, strempty(p->new_label), root,
-                                    p->fs_uuid, arg_discard, /* quiet = */ false,
+                                    p->fs_uuid, arg_discard,
+                                    /* quiet = */ streq(p->format, "erofs") && !DEBUG_LOGGING,
                                     context->fs_sector_size, p->compression, p->compression_level,
                                     extra_mkfs_options);
                 if (r < 0)
@@ -6587,7 +6587,7 @@ static int context_split(Context *context) {
 
                         r = read_attr_fd(fd, &attrs);
                         if (r < 0 && !ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                                return log_error_errno(r, "Failed to read file attributes of %s: %m", arg_node);
+                                log_warning_errno(r, "Failed to read file attributes of %s, ignoring: %m", arg_node);
                 }
 
                 fdt = xopenat_full(
@@ -7248,6 +7248,29 @@ static bool need_fstab(const Context *context) {
         return false;
 }
 
+static int make_by_uuid_symlink_path(const Partition *p, char **ret) {
+        _cleanup_free_ char *what = NULL;
+
+        assert(p);
+        assert(ret);
+
+        if (streq_ptr(p->format, "vfat")) {
+                if (asprintf(&what, "UUID=%04X-%04X",
+                             ((uint32_t) p->fs_uuid.bytes[0] << 8) |
+                             ((uint32_t) p->fs_uuid.bytes[1] << 0),
+                             ((uint32_t) p->fs_uuid.bytes[2] << 8) |
+                             ((uint32_t) p->fs_uuid.bytes[3])) < 0) /* Take first 32 bytes of UUID */
+                        return log_oom();
+        } else {
+                what = strjoin("UUID=", SD_ID128_TO_UUID_STRING(p->fs_uuid));
+                if (!what)
+                        return log_oom();
+        }
+
+        *ret = TAKE_PTR(what);
+        return 0;
+}
+
 static int context_fstab(Context *context) {
         _cleanup_(unlink_and_freep) char *t = NULL;
         _cleanup_fclose_ FILE *f = NULL;
@@ -7281,9 +7304,9 @@ static int context_fstab(Context *context) {
                 if (!need_fstab_one(p))
                         continue;
 
-                what = strjoin("UUID=", SD_ID128_TO_UUID_STRING(p->fs_uuid));
-                if (!what)
-                        return log_oom();
+                r = make_by_uuid_symlink_path(p, &what);
+                if (r < 0)
+                        return r;
 
                 FOREACH_ARRAY(mountpoint, p->mountpoints, p->n_mountpoints) {
                         r = partition_pick_mount_options(
@@ -7457,7 +7480,7 @@ static int context_minimize(Context *context) {
 
         r = read_attr_fd(context->backing_fd, &attrs);
         if (r < 0 && !ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                return log_error_errno(r, "Failed to read file attributes of %s: %m", arg_node);
+                log_warning_errno(r, "Failed to read file attributes of %s, ignoring: %m", arg_node);
 
         LIST_FOREACH(partitions, p, context->partitions) {
                 _cleanup_(rm_rf_physical_and_freep) char *root = NULL;
@@ -7556,7 +7579,8 @@ static int context_minimize(Context *context) {
                                     strempty(p->new_label),
                                     root,
                                     fs_uuid,
-                                    arg_discard, /* quiet = */ false,
+                                    arg_discard,
+                                    /* quiet = */ streq(p->format, "erofs") && !DEBUG_LOGGING,
                                     context->fs_sector_size,
                                     p->compression,
                                     p->compression_level,
@@ -7639,7 +7663,7 @@ static int context_minimize(Context *context) {
                                     root,
                                     p->fs_uuid,
                                     arg_discard,
-                                    /* quiet = */ false,
+                                    /* quiet = */ streq(p->format, "erofs") && !DEBUG_LOGGING,
                                     context->fs_sector_size,
                                     p->compression,
                                     p->compression_level,

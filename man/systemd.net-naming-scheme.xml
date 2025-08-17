@@ -94,7 +94,8 @@
       </tgroup>
     </table>
 
-    <para>The udev <command>net_id</command> builtin exports the following udev device properties:</para>
+    <para>The <citerefentry><refentrytitle>udev</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+    <command>net_id</command> builtin exports the following device properties:</para>
 
     <variablelist>
         <varlistentry>
@@ -243,7 +244,7 @@
           name and the bus number are ignored.</para>
 
           <para>In some configurations a parent PCI bridge of a given network controller may be associated
-          with a slot. In such case we don't generate this device property to avoid possible naming conflicts.</para>
+          with a slot. In such case we do not generate this device property to avoid possible naming conflicts.</para>
 
           <xi:include href="version-info.xml" xpointer="v243"/>
           </listitem>
@@ -431,7 +432,7 @@
           <listitem><para>When a PCI slot is associated with a PCI bridge that has multiple child network
           controllers, the same value of the <varname>ID_NET_NAME_SLOT</varname> property might be derived
           for those controllers. This would cause a naming conflict if the property is selected as the device
-          name. Now, we detect this situation and don't produce the <varname>ID_NET_NAME_SLOT</varname>
+          name. Now, we detect this situation and do not produce the <varname>ID_NET_NAME_SLOT</varname>
           property.</para>
 
           <xi:include href="version-info.xml" xpointer="v247"/></listitem>
@@ -451,9 +452,10 @@
           than 16381 (2¹⁴-1) were ignored. For s390 PCI devices index values up to 65535 (2¹⁶-1) are valid.
           To account for that, the limit was increased to 65535.</para>
 
-          <para>The udev rule <varname>NAME=</varname> replaces <literal>:</literal>,
-          <literal>/</literal>, and <literal>%</literal> with an underscore (<literal>_</literal>), and
-          refuses strings which contain only numerics.</para>
+          <para>The <citerefentry><refentrytitle>udev</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+          rule <varname>NAME=</varname> replaces <literal>:</literal>, <literal>/</literal>, and
+          <literal>%</literal> with an underscore (<literal>_</literal>), and refuses strings which contain
+          only digits.</para>
 
           <xi:include href="version-info.xml" xpointer="v249"/>
           </listitem>
@@ -549,10 +551,11 @@
   <refsect1>
     <title>Limiting the use of specific sysfs attributes</title>
 
-    <para>When creating names for network cards, some naming schemes use data from sysfs populated
-    by the kernel. This means that although a specific naming scheme in udev is picked,
-    the network card's name can still change when a new kernel version adds a new sysfs attribute.
-    For example if kernel starts setting the <constant>phys_port_name</constant>, udev will append the
+    <para>When creating names for network cards, some naming schemes use data from sysfs populated by the
+    kernel. This means that although a specific naming scheme in
+    <citerefentry><refentrytitle>udev</refentrytitle><manvolnum>7</manvolnum></citerefentry> is picked, the
+    network card's name can still change when a new kernel version adds a new sysfs attribute. For example,
+    if kernel starts setting the <constant>phys_port_name</constant>, <command>udev</command> will append the
     "<constant>n</constant><replaceable>phys_port_name</replaceable>" suffix to the device name.</para>
 
     <variablelist>

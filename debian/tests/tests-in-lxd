@@ -3,6 +3,9 @@
 # run some autopkgtest tests in lxd
 set -eux
 
+# Until setup is complete, treat all errors as skippable.
+trap 'exit 77' EXIT
+
 RELEASE=$(
     . /etc/os-release;
     if [ "$ID" = "ubuntu" ]; then
@@ -13,7 +16,7 @@ RELEASE=$(
         else
             debian_version="$(cat /etc/debian_version)"
             if [ "${debian_version#*/}" = sid ]; then
-                if [ "$VERSION_CODENAME" = sid ] || grep -q -r sid /etc/apt/sources.list* || grep -q -r unstable /etc/apt/sources.list*; then
+                if [ ! -f /etc/apt/preferences.d/autopkgtest-unstable.pref ] && ( [ "$VERSION_CODENAME" = sid ] || grep -q -r sid /etc/apt/sources.list* || grep -q -r unstable /etc/apt/sources.list* ); then
                     echo "sid"
                 else
                     echo "$VERSION_CODENAME"
@@ -62,6 +65,9 @@ lxc file push -r /etc/apt systemd-lxc/etc/
 if [ -f /etc/apt/sources.list.d/autopkgtest.list ]; then
     lxc exec systemd-lxc -- sed -i 's|/tmp/autopkgtest.[^/]*/|/root/|' /etc/apt/sources.list.d/autopkgtest.list || true
 fi
+# auto-apt-proxy cannot be installed until after apt-get update, but apt-get update
+# cannot be ran successfully until auto-apt-proxy is installed
+lxc exec systemd-lxc -- rm -f /etc/apt/apt.conf.d/auto-apt-proxy.conf
 
 if [ -d "${AUTOPKGTEST_TMP:-}/../tree" ]; then
     cd "${AUTOPKGTEST_TMP:-}/../tree"
@@ -81,10 +87,21 @@ fi
 lxc stop systemd-lxc
 lxc publish systemd-lxc --reuse --alias "$IMAGE"
 
+# Clear the previous exit code trap.
+trap - EXIT
+
 # Only test unprivileged LXD containers, since privileged LXD containers cause LoadCredential= (LP: #1950787),
 # and other things to break. According to upstream LXD, we should not worry to much about privileged LXD
 # containers anyways (see https://bugs.launchpad.net/ubuntu/+source/lxd/+bug/1950787/comments/4).
 #
 # We would like to have a simple boot smoke test for privileged LXD containers still, but cannot do
 # so until LP: #1998943 is fixed in autopkgtest.
+#
+# Ensure that skipped nested tests do not fail the outer test invocation.
+set +e
 autopkgtest -U -B . --test-name=unit-tests --test-name=boot-and-services -- lxd "$IMAGE"
+r=$?
+if [ $r -eq 2 ]; then
+    exit 0
+fi
+exit $r

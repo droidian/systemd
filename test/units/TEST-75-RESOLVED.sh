@@ -22,6 +22,11 @@ if ! knotc -c /usr/lib/systemd/tests/testdata/knot-data/knot.conf conf-check; th
     exit 77
 fi
 
+if ! command -v resolvectl >/dev/null || ! command -v networkctl >/dev/null; then
+    echo "resolved/networkd not found, skipping..." | tee --append /skipped
+    exit 77
+fi
+
 RUN_OUT="$(mktemp)"
 
 run() {
@@ -149,10 +154,13 @@ EOF
     # Create a trust anchor for resolved with our root zone
     keymgr . ds | sed 's/ DS/ IN DS/g' >/etc/dnssec-trust-anchors.d/root.positive
     # Create a bind-compatible trust anchor (for delv)
-    # Note: the trust-anchors directive is relatively new, so use the original
-    #       managed-keys one until it's widespread enough
+    # Note: managed-keys was removed in version 9.21, use the newer trust-anchors directive
     {
-        echo 'managed-keys {'
+        if systemd-analyze compare-versions "$(delv -v | awk '{print $2}')" ge 9.21; then
+            echo 'trust-anchors {'
+        else
+            echo 'managed-keys {'
+        fi
         keymgr . dnskey | sed -r 's/^\. DNSKEY ([0-9]+ [0-9]+ [0-9]+) (.+)$/. static-key \1 "\2";/g'
         echo '};'
     } >/etc/bind.keys
@@ -339,6 +347,7 @@ manual_testcase_02_mdns_llmnr() {
     # defaults to yes (both the global and per-link settings are yes)
     assert_in 'yes' "$(resolvectl mdns hoge)"
     assert_in 'yes' "$(resolvectl llmnr hoge)"
+    lsof -p "$(systemctl show --property MainPID --value systemd-resolved.service)" | grep -q ":mdns\|:5353"
     # set per-link setting
     resolvectl mdns hoge yes
     resolvectl llmnr hoge yes
@@ -379,6 +388,7 @@ manual_testcase_02_mdns_llmnr() {
         echo "LLMNR=no"
     } >/run/systemd/resolved.conf.d/mdns-llmnr.conf
     systemctl reload systemd-resolved.service
+    (! lsof -p "$(systemctl show --property MainPID --value systemd-resolved.service)" | grep -q ":mdns\|:5353")
     # set per-link setting
     resolvectl mdns hoge yes
     resolvectl llmnr hoge yes
@@ -934,6 +944,15 @@ testcase_11_nft() {
 
 # Test resolvectl show-server-state
 testcase_12_resolvectl2() {
+    # Cleanup
+    # shellcheck disable=SC2317
+    cleanup() {
+        rm -f /run/systemd/resolved.conf.d/reload.conf
+        systemctl reload systemd-resolved.service
+    }
+
+    trap cleanup RETURN
+
     run resolvectl show-server-state
     grep -qF "10.0.0.1" "$RUN_OUT"
     grep -qF "Interface" "$RUN_OUT"
@@ -981,16 +1000,39 @@ testcase_12_resolvectl2() {
     {
         echo "[Resolve]"
         echo "DNS=8.8.8.8"
+        echo "DNSStubListenerExtra=127.0.0.153"
     } >/run/systemd/resolved.conf.d/reload.conf
     resolvectl dns dns0 1.1.1.1
     systemctl reload systemd-resolved.service
     resolvectl status
-    resolvectl dns dns0 | grep -qF "1.1.1.1"
-    # For some reason piping this last command to grep fails with:
-    # 'resolvectl[1378]: Failed to print table: Broken pipe'
-    # so use an intermediate file in /tmp/
-    resolvectl >/tmp/output
-    grep -qF "DNS Servers: 8.8.8.8" /tmp/output
+
+    run resolvectl dns dns0
+    grep -qF "1.1.1.1" "$RUN_OUT"
+
+    run resolvectl dns
+    grep -qF "8.8.8.8" "$RUN_OUT"
+
+    run ss -4nl
+    grep -qF '127.0.0.153' "$RUN_OUT"
+
+    {
+        echo "[Resolve]"
+        echo "DNS=8.8.4.4"
+        echo "DNSStubListenerExtra=127.0.0.154"
+    } >/run/systemd/resolved.conf.d/reload.conf
+    systemctl reload systemd-resolved.service
+    resolvectl status
+
+    run resolvectl dns dns0
+    grep -qF "1.1.1.1" "$RUN_OUT"
+
+    run resolvectl dns
+    (! grep -qF "8.8.8.8" "$RUN_OUT")
+    grep -qF "8.8.4.4" "$RUN_OUT"
+
+    run ss -4nl
+    (! grep -qF '127.0.0.153' "$RUN_OUT")
+    grep -qF '127.0.0.154' "$RUN_OUT"
 
     # Check if resolved exits cleanly.
     restart_resolved

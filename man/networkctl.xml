@@ -156,7 +156,7 @@
                 <term>pending</term>
                 <listitem>
                   <para><citerefentry><refentrytitle>systemd-udevd</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-                  is still processing the link, we don't yet know if we will manage it.</para>
+                  is still processing the link, we do not yet know if we will manage it.</para>
 
                   <xi:include href="version-info.xml" xpointer="v240"/>
                 </listitem>
@@ -165,7 +165,7 @@
                 <term>initialized</term>
                 <listitem>
                   <para><citerefentry><refentrytitle>systemd-udevd</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-                  has processed the link, but we don't yet know if we will manage it.</para>
+                  has processed the link, but we do not yet know if we will manage it.</para>
 
                   <xi:include href="version-info.xml" xpointer="v251"/>
                 </listitem>
@@ -296,7 +296,7 @@
         <listitem>
           <para>Show discovered LLDP (Link Layer Discovery Protocol) neighbors. If one or more
           <replaceable>PATTERN</replaceable>s are specified only neighbors on those interfaces are shown.
-          Otherwise shows discovered neighbors on all interfaces. Note that for this feature to work,
+          Otherwise, shows discovered neighbors on all interfaces. Note that for this feature to work,
           <varname>LLDP=</varname> must be turned on for the specific interface, see
           <citerefentry><refentrytitle>systemd.network</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
           details.</para>
@@ -422,7 +422,8 @@ s - Service VLAN, m - Two-port MAC Relay (TPMR)
           was created, so changing [VLAN] <varname>Id=</varname> will not take effect if the matching VLAN
           interface already exists. To apply such settings, the interfaces need to be removed manually before
           reload. Also note that even if a <filename>.netdev</filename> file is removed,
-          <command>systemd-networkd</command> does not remove the existing netdev corresponding to the file.
+          <citerefentry><refentrytitle>systemd-networkd</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+          does not remove the existing netdev corresponding to the file.
           </para>
 
           <para>If a new, modified, or removed <filename>.network</filename> file is found, then all
@@ -449,9 +450,9 @@ s - Service VLAN, m - Two-port MAC Relay (TPMR)
 
         <para>If <option>--drop-in=</option> is specified, edit the drop-in file instead of
         the main configuration file. Unless <option>--no-reload</option> is specified,
-        <command>systemd-networkd</command> will be reloaded after the edit of the
-        <filename>.network</filename> or <filename>.netdev</filename> files finishes.
-        The same applies for <filename>.link</filename> files and
+        <citerefentry><refentrytitle>systemd-networkd</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        will be reloaded after the edit of the <filename>.network</filename> or <filename>.netdev</filename>
+        files finishes. The same applies for <filename>.link</filename> files and
         <citerefentry><refentrytitle>systemd-udevd</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
         Note that the changed link settings are not automatically applied after reloading.
         To achieve that, trigger uevents for the corresponding interface. Refer to
@@ -520,8 +521,9 @@ s - Service VLAN, m - Two-port MAC Relay (TPMR)
           <replaceable>BOOL</replaceable>
         </term>
         <listitem>
-          <para>Notify <filename>systemd-networkd.service</filename> that the persistent storage for the
-          service is ready. This is called by
+          <para>Notify
+          <citerefentry><refentrytitle>systemd-networkd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+          that the persistent storage for the service is ready. This is called by
           <filename>systemd-networkd-persistent-storage.service</filename>. Usually, this command should not
           be called manually by users or administrators.</para>
 
@@ -632,7 +634,7 @@ s - Service VLAN, m - Two-port MAC Relay (TPMR)
           drop-in directories are created and populated in one go.</para>
 
           <para>Multiple drop-ins may be "edited" in this mode with <option>--drop-in=</option>, and
-          the same contents will be written to all of them. Otherwise exactly one main configuration file
+          the same contents will be written to all of them. Otherwise, exactly one main configuration file
           is expected.</para>
 
           <xi:include href="version-info.xml" xpointer="v257"/>

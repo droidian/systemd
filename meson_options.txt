@@ -330,6 +330,8 @@ option('dev-kvm-mode', type : 'string', value : '0666',
        description : '/dev/kvm access mode')
 option('group-render-mode', type : 'string', value : '0666',
        description : 'Access mode for devices owned by render group (e.g. /dev/dri/renderD*, /dev/kfd).')
+option('tty-mode', type : 'string', value : '0620',
+       description : 'Access mode for tty/pts device nodes.')
 option('default-kill-user-processes', type : 'boolean',
        description : 'the default value for KillUserProcesses= setting')
 option('gshadow', type : 'boolean',
@@ -506,8 +508,8 @@ option('tests', type : 'combo', choices : ['true', 'unsafe', 'false'],
        description : 'enable extra tests with =unsafe')
 option('slow-tests', type : 'boolean', value : false,
        description : 'run the slow tests by default')
-option('fuzz-tests', type : 'boolean', value : false,
-       description : 'run the fuzzer regression tests by default (with sanitizers)')
+option('fuzz-tests', type : 'boolean', value : true,
+       description : 'run the fuzzer regression tests')
 option('install-tests', type : 'boolean', value : false,
        description : 'install test executables')
 option('log-message-verification', type : 'feature', deprecated : { 'true' : 'enabled', 'false' : 'disabled' },

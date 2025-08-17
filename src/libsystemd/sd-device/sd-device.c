@@ -234,7 +234,7 @@ int device_set_syspath(sd_device *device, const char *_syspath, bool verify) {
 
                 r = path_simplify_alloc(_syspath, &syspath);
                 if (r < 0)
-                        return r;
+                        return log_oom_debug();
         }
 
         assert_se(devpath = startswith(syspath, "/sys"));
@@ -401,7 +401,6 @@ static int device_new_from_path_join(
         int r;
 
         assert(device);
-        assert(subsystem);
         assert(sysname);
 
         p = path_join(a, b, c, d);
@@ -486,13 +485,13 @@ _public_ int sd_device_new_from_subsystem_sysname(
 
         if (streq(subsystem, "subsystem")) {
                 FOREACH_STRING(s, "/sys/bus/", "/sys/class/") {
-                        r = device_new_from_path_join(&device, subsystem, NULL, sysname, s, name, NULL, NULL);
+                        r = device_new_from_path_join(&device, subsystem, /* driver_subsystem = */ NULL, sysname, s, name, NULL, NULL);
                         if (r < 0)
                                 return r;
                 }
 
         } else if (streq(subsystem, "module")) {
-                r = device_new_from_path_join(&device, subsystem, NULL, sysname, "/sys/module/", name, NULL, NULL);
+                r = device_new_from_path_join(&device, subsystem, /* driver_subsystem = */ NULL, sysname, "/sys/module/", name, NULL, NULL);
                 if (r < 0)
                         return r;
 
@@ -508,21 +507,23 @@ _public_ int sd_device_new_from_subsystem_sysname(
                         if (streq(sep, "drivers")) /* If the sysname is "drivers", then it's the drivers directory itself that is meant. */
                                 r = device_new_from_path_join(&device, subsystem, subsys, "drivers", "/sys/bus/", subsys, "/drivers", NULL);
                         else
-                                r = device_new_from_path_join(&device, subsystem, subsys, sep, "/sys/bus/", subsys, "/drivers/", sep);
+                                r = device_new_from_path_join(&device, subsystem, subsys, sysname + (sep - name), "/sys/bus/", subsys, "/drivers/", sep);
                         if (r < 0)
                                 return r;
                 }
         }
 
-        r = device_new_from_path_join(&device, subsystem, NULL, sysname, "/sys/bus/", subsystem, "/devices/", name);
+        r = device_new_from_path_join(&device, subsystem, /* driver_subsystem = */ NULL, sysname, "/sys/bus/", subsystem, "/devices/", name);
         if (r < 0)
                 return r;
 
-        r = device_new_from_path_join(&device, subsystem, NULL, sysname, "/sys/class/", subsystem, name, NULL);
+        r = device_new_from_path_join(&device, subsystem, /* driver_subsystem = */ NULL, sysname, "/sys/class/", subsystem, name, NULL);
         if (r < 0)
                 return r;
 
-        r = device_new_from_path_join(&device, subsystem, NULL, sysname, "/sys/firmware/", subsystem, name, NULL);
+        /* Note that devices under /sys/firmware/ (e.g. /sys/firmware/devicetree/base/) do not have
+         * subsystem. Hence, pass NULL for subsystem. See issue #35861. */
+        r = device_new_from_path_join(&device, /* subsystem = */ NULL, /* driver_subsystem = */ NULL, sysname, "/sys/firmware/", subsystem, name, NULL);
         if (r < 0)
                 return r;
 
@@ -913,15 +914,24 @@ _public_ int sd_device_new_from_device_id(sd_device **ret, const char *id) {
         }
 
         case '+': {
-                const char *subsys, *sep;
-
-                sep = strchr(id + 1, ':');
-                if (!sep || sep - id - 1 > NAME_MAX)
+                const char *sep = strchr(id + 1, ':');
+                if (!sep || sep[1] == '\0')
                         return -EINVAL;
 
-                subsys = memdupa_suffix0(id + 1, sep - id - 1);
+                _cleanup_free_ char *subsystem = strndup(id + 1, sep - id - 1);
+                if (!subsystem)
+                        return -ENOMEM;
 
-                return sd_device_new_from_subsystem_sysname(ret, subsys, sep + 1);
+                _cleanup_free_ char *sysname = strdup(sep + 1);
+                if (!sysname)
+                        return -ENOMEM;
+
+                /* Device ID uses device directory name as is, hence may contain '!', but
+                 * sd_device_new_from_subsystem_sysname() expects that the input is sysname,
+                 * that is, '!' must be replaced with '/'. */
+                string_replace_char(sysname, '!', '/');
+
+                return sd_device_new_from_subsystem_sysname(ret, subsystem, sysname);
         }
 
         default:

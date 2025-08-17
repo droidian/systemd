@@ -316,6 +316,27 @@ bool link_check_addresses_ready(Link *link, NetworkConfigSource source) {
                 has = true;
         }
 
+        if (has || source != NETWORK_CONFIG_SOURCE_DHCP6)
+                return has;
+
+        /* If there is no DHCPv6 addresses, but all conflicting addresses are successfully configured, then
+         * let's handle the DHCPv6 client successfully configured addresses. Otherwise, if the conflicted
+         * addresses are static or foreign, and there is no other dynamic addressing protocol enabled, then
+         * the link will never enter the configured state. See also link_check_ready(). */
+        SET_FOREACH(a, link->addresses) {
+                if (source >= 0 && a->source == NETWORK_CONFIG_SOURCE_DHCP6)
+                        continue;
+                if (!a->also_requested_by_dhcp6)
+                        continue;
+                if (address_is_marked(a))
+                        continue;
+                if (!address_exists(a))
+                        continue;
+                if (!address_is_ready(a))
+                        return false;
+                has = true;
+        }
+
         return has;
 }
 
@@ -1940,6 +1961,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 nft_set_context_clear(&address->nft_set_context);
                 (void) nft_set_context_dup(&a->nft_set_context, &address->nft_set_context);
                 address->requested_as_null = a->requested_as_null;
+                address->also_requested_by_dhcp6 = a->also_requested_by_dhcp6;
                 address->callback = a->callback;
 
                 ipv6_token_ref(a->token);
@@ -2400,16 +2422,22 @@ int address_section_verify(Address *address) {
         return 0;
 }
 
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+        trivial_hash_ops_address_detach,
+        void,
+        trivial_hash_func,
+        trivial_compare_func,
+        Address,
+        address_detach);
+
 int network_drop_invalid_addresses(Network *network) {
-        _cleanup_set_free_ Set *addresses = NULL;
+        _cleanup_set_free_ Set *addresses = NULL, *duplicated_addresses = NULL;
         Address *address;
         int r;
 
         assert(network);
 
         ORDERED_HASHMAP_FOREACH(address, network->addresses_by_section) {
-                Address *dup;
-
                 if (address_section_verify(address) < 0) {
                         /* Drop invalid [Address] sections or Address= settings in [Network].
                          * Note that address_detach() will drop the address from addresses_by_section. */
@@ -2418,7 +2446,7 @@ int network_drop_invalid_addresses(Network *network) {
                 }
 
                 /* Always use the setting specified later. So, remove the previously assigned setting. */
-                dup = set_remove(addresses, address);
+                Address *dup = set_remove(addresses, address);
                 if (dup) {
                         log_warning("%s: Duplicated address %s is specified at line %u and %u, "
                                     "dropping the address setting specified at line %u.",
@@ -2427,8 +2455,12 @@ int network_drop_invalid_addresses(Network *network) {
                                     address->section->line,
                                     dup->section->line, dup->section->line);
 
-                        /* address_detach() will drop the address from addresses_by_section. */
-                        address_detach(dup);
+                        /* Do not call address_detach() for 'dup' now, as we can remove only the current
+                         * entry in the loop. We will drop the address from addresses_by_section later. */
+                        r = set_ensure_put(&duplicated_addresses, &trivial_hash_ops_address_detach, dup);
+                        if (r < 0)
+                                return log_oom();
+                        assert(r > 0);
                 }
 
                 /* Use address_hash_ops, instead of address_hash_ops_detach. Otherwise, the Address objects

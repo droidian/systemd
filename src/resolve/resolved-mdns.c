@@ -22,6 +22,19 @@ void manager_mdns_stop(Manager *m) {
         m->mdns_ipv6_fd = safe_close(m->mdns_ipv6_fd);
 }
 
+void manager_mdns_maybe_stop(Manager *m) {
+        assert(m);
+
+        /* This stops mDNS only when no interface enables mDNS. */
+
+        Link *l;
+        HASHMAP_FOREACH(l, m->links)
+                if (link_get_mdns_support(l) != RESOLVE_SUPPORT_NO)
+                        return;
+
+        manager_mdns_stop(m);
+}
+
 int manager_mdns_start(Manager *m) {
         int r;
 
@@ -388,8 +401,10 @@ static int on_mdns_packet(sd_event_source *s, int fd, uint32_t revents, void *us
         /* Refuse traffic from the local host, to avoid query loops. However, allow legacy mDNS
          * unicast queries through anyway (we never send those ourselves, hence no risk).
          * i.e. check for the source port nr. */
-        if (p->sender_port == MDNS_PORT && manager_packet_from_local_address(m, p))
+        if (p->sender_port == MDNS_PORT && manager_packet_from_local_address(m, p)) {
+                log_debug("Got mDNS UDP packet from local host, ignoring.");
                 return 0;
+        }
 
         scope = manager_find_scope(m, p);
         if (!scope) {
@@ -399,6 +414,15 @@ static int on_mdns_packet(sd_event_source *s, int fd, uint32_t revents, void *us
 
         if (dns_packet_validate_reply(p) > 0) {
                 DnsResourceRecord *rr;
+
+                /* RFC 6762 section 6:
+                 * The source UDP port in all Multicast DNS responses MUST be 5353 (the well-known port
+                 * assigned to mDNS). Multicast DNS implementations MUST silently ignore any Multicast DNS
+                 * responses they receive where the source UDP port is not 5353. */
+                if (p->sender_port != MDNS_PORT) {
+                        log_debug("Got mDNS reply from non-mDNS port %u (not %i), ignoring.", p->sender_port, MDNS_PORT);
+                        return 0;
+                }
 
                 log_debug("Got mDNS reply packet");
 
